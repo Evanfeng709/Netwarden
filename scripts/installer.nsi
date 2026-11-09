@@ -10,7 +10,7 @@ ManifestDPIAware true
 !include "LogicLib.nsh"
 
 !define PRODUCT_NAME "SSH Keywarden"
-!define PRODUCT_VERSION "2026.11.3-5"
+!define PRODUCT_VERSION "2026.11.9-1"
 !define PRODUCT_PUBLISHER "github"
 !define PRODUCT_EXE "kw-desktop.exe"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
@@ -23,7 +23,7 @@ RequestExecutionLevel user
 SetCompressor /SOLID lzma
 SetCompressorDictSize 64
 
-VIProductVersion "2026.11.3.0"
+VIProductVersion "2026.11.9.1"
 VIAddVersionKey "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey "FileDescription" "${PRODUCT_NAME} Setup"
 VIAddVersionKey "FileVersion" "${PRODUCT_VERSION}"

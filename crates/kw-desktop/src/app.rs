@@ -31,6 +31,91 @@ use crate::icons::{draw_icon, Icon};
 use crate::theme::{apply_palette, resolve_palette, Palette, PALETTES, THEME_CHOICES};
 use crate::vt::{is_wide_char, VtScreen};
 
+/// SSH 登录密码的本机独立存储（host_id -> 密码）。
+/// 与 config.json / 云同步 / 导出完全隔离，沿用 proxy-auth.json 的同级安全口径：
+/// 只有用户在「添加 / 编辑服务器」里填写才落盘，Windows 依赖用户目录 ACL。
+fn login_pw_file(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("login-auth.json")
+}
+
+fn read_login_pw(data_dir: &std::path::Path, host_id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(login_pw_file(data_dir)).ok()?;
+    let map: HashMap<String, String> = serde_json::from_str(&text).ok()?;
+    map.get(host_id).cloned().filter(|s| !s.is_empty())
+}
+
+fn write_login_pw(data_dir: &std::path::Path, host_id: &str, password: Option<&str>) {
+    let path = login_pw_file(data_dir);
+    let mut map: HashMap<String, String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    match password {
+        Some(p) if !p.is_empty() => {
+            map.insert(host_id.to_string(), p.to_string());
+        }
+        _ => {
+            map.remove(host_id);
+        }
+    }
+    if map.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+/// 认证方式的本机独立存储：host_id -> "password" / "key"。
+/// 与 config.json / 云同步 / 导出隔离，和 login-auth.json 同级。
+fn auth_method_file(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("auth-method.json")
+}
+
+fn read_auth_method(data_dir: &std::path::Path, host_id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(auth_method_file(data_dir)).ok()?;
+    let map: HashMap<String, String> = serde_json::from_str(&text).ok()?;
+    map.get(host_id)
+        .cloned()
+        .filter(|s| s == "password" || s == "key")
+}
+
+fn write_auth_method(data_dir: &std::path::Path, host_id: &str, method: Option<&str>) {
+    let path = auth_method_file(data_dir);
+    let mut map: HashMap<String, String> = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    match method {
+        Some(m) if m == "password" || m == "key" => {
+            map.insert(host_id.to_string(), m.to_string());
+        }
+        _ => {
+            map.remove(host_id);
+        }
+    }
+    if map.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Ok(text) = serde_json::to_string_pretty(&map) {
+        let _ = std::fs::write(&path, text);
+    }
+}
+
+/// 私钥是否真的需要口令。连接时用的 `private_key_openssh` 内部就是
+/// `kw_keys::keygen::load_private_key`，所以这个预检不会和后端判定不一致。
+fn private_key_needs_passphrase(path: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    match kw_keys::keygen::load_private_key(&text, None) {
+        Ok(_) => false,
+        Err(e) => e.contains("passphrase") || e.contains("ENCRYPTED"),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Keys,
@@ -71,6 +156,8 @@ enum Drawer {
         host: String,
         port: String,
         username: String,
+        auth_method: String,
+        password: String,
         identity_file: String,
         remote_path: String,
         proxy_enabled: bool,
@@ -801,10 +888,35 @@ impl KwDesktopApp {
 
     fn start_connect_flow(&mut self, host: HostEntry, target_mode: ViewMode) {
         self.switch_mode(target_mode);
+        let saved_pw = read_login_pw(&self.data_dir, &host.id).unwrap_or_default();
+        let method = read_auth_method(&self.data_dir, &host.id).unwrap_or_default();
+
+        // 密码登录：直接用添加时保存的密码，不再弹窗问「服务器密码是多少」。
+        // 同时清空私钥路径，避免后端先拿公钥去试认证。
+        if method == "password" {
+            let mut h = host.clone();
+            h.identity_file.clear();
+            self.execute_connect(h, target_mode, saved_pw, String::new(), String::new(), None);
+            return;
+        }
+
+        // 密钥登录：免密私钥直接连；只有私钥确实加密时才弹窗要 passphrase。
+        if method == "key" && !private_key_needs_passphrase(&host.identity_file) {
+            self.execute_connect(
+                host,
+                target_mode,
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+            );
+            return;
+        }
+
         self.drawer = Drawer::ConnectPrompt {
             host,
             target_mode,
-            password: String::new(),
+            password: saved_pw,
             passphrase: String::new(),
             proxy_password: String::new(),
             trust_fp: None,
@@ -1968,10 +2080,8 @@ impl KwDesktopApp {
     /// 顶栏里的会话标签（原独立标签栏并入顶栏，省掉一条 34px）。
     fn draw_tabs(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
+        // 无会话时不显示孤立的「＋」按钮；左侧「主机与密钥」导航仍可进入。
         if self.tabs.is_empty() {
-            if Self::tiny_btn(ui, "＋", p.faint) {
-                self.switch_mode(ViewMode::Keys);
-            }
             return;
         }
         // 只有在终端视图里，活动标签才算"真活动" —— 否则在主机页看它亮着会误导
@@ -2320,12 +2430,7 @@ impl KwDesktopApp {
                         p.dim,
                     );
 
-                    // 竖直分隔：左边是身份，右边是会话标签（原来在第二条 bar 上）
-                    ui.add_space(10.0);
-                    let (sep_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(1.0, 18.0), Sense::hover());
-                    ui.painter()
-                        .rect_filled(sep_rect, CornerRadius::same(0), p.border);
+                    // 版本号后不再画竖直分隔条：空态时它旁边只剩一个孤零零的按钮，视觉多余。
                     ui.add_space(8.0);
                     self.draw_tabs(ui);
 
@@ -2744,15 +2849,7 @@ impl KwDesktopApp {
                             .strong()
                             .color(if connected { p.ok } else { p.dim }),
                     );
-                    ui.separator();
-
-                    let latest = self
-                        .logs
-                        .last()
-                        .map(|l| format!("[{}] {}", l.time, l.text))
-                        .unwrap_or_default();
-                    ui.label(RichText::new(latest).size(11.5).monospace().color(p.dim));
-
+                    // 底栏不再常驻显示最近一条日志；要看日志点右侧「展开日志」。
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let toggle_lbl = if self.show_log_drawer {
                             "▼ 收起日志"
@@ -5063,6 +5160,14 @@ impl KwDesktopApp {
 
     fn open_host_edit(&mut self, entry: Option<HostEntry>) {
         if let Some(h) = entry {
+            let login_pw = read_login_pw(&self.data_dir, &h.id);
+            let auth_method = read_auth_method(&self.data_dir, &h.id).unwrap_or_else(|| {
+                if h.identity_file.trim().is_empty() {
+                    "password".to_string()
+                } else {
+                    "key".to_string()
+                }
+            });
             let pw_saved = self.engine.proxy_password_saved(&h.id);
             let proxy_on = h.proxy_enabled();
             let proxy_port = h.proxy_port_or_default();
@@ -5072,6 +5177,8 @@ impl KwDesktopApp {
                 host: h.host,
                 port: h.port.to_string(),
                 username: h.username,
+                auth_method,
+                password: login_pw.unwrap_or_default(),
                 identity_file: h.identity_file,
                 remote_path: h.remote_path,
                 proxy_enabled: proxy_on,
@@ -5098,6 +5205,8 @@ impl KwDesktopApp {
                 host: String::new(),
                 port: "22".to_string(),
                 username: "root".to_string(),
+                auth_method: "password".to_string(),
+                password: String::new(),
                 identity_file: String::new(),
                 remote_path: def_path,
                 proxy_enabled: false,
@@ -5226,6 +5335,8 @@ impl KwDesktopApp {
                         host,
                         port,
                         username,
+                        auth_method,
+                        password,
                         identity_file,
                         remote_path,
                         proxy_enabled,
@@ -5280,6 +5391,8 @@ impl KwDesktopApp {
                                     host.clear();
                                     *port = "22".to_string();
                                     *username = "root".to_string();
+                                    *auth_method = "password".to_string();
+                                    password.clear();
                                     identity_file.clear();
                                     *remote_path = def_path;
                                     *proxy_enabled = false;
@@ -5577,23 +5690,47 @@ impl KwDesktopApp {
                                                 );
                                                 ui.end_row();
 
-                                                ui.label(RichText::new("私钥路径").color(p.dim));
+                                                ui.label(RichText::new("认证方式").color(p.dim));
                                                 ui.horizontal(|ui| {
-                                                    ui.add(
-                                                        egui::TextEdit::singleline(identity_file)
-                                                            .hint_text("可选，留空则在连接时输入密码")
-                                                            .desired_width(272.0),
-                                                    );
-                                                    if ui.button("浏览…").clicked() {
-                                                        if let Some(path) =
-                                                            rfd::FileDialog::new().pick_file()
-                                                        {
-                                                            *identity_file =
-                                                                path.to_string_lossy().to_string();
-                                                        }
-                                                    }
+                                                    ui.radio_value(auth_method, "password".to_string(), "密码登录");
+                                                    ui.radio_value(auth_method, "key".to_string(), "密钥登录");
                                                 });
                                                 ui.end_row();
+
+                                                if auth_method.as_str() == "password" {
+                                                    ui.label(RichText::new("登录密码 *").color(p.dim));
+                                                    ui.vertical(|ui| {
+                                                        ui.add(
+                                                            egui::TextEdit::singleline(&mut *password)
+                                                                .password(true)
+                                                                .hint_text("密码登录时使用；连接时自动带入，不再询问")
+                                                                .desired_width(336.0),
+                                                        );
+                                                        ui.label(
+                                                            RichText::new("仅存本机独立文件，不写入配置、不参与同步与导出")
+                                                                .size(10.0)
+                                                                .color(p.faint),
+                                                        );
+                                                    });
+                                                    ui.end_row();
+                                                }
+
+                                                if auth_method.as_str() == "key" {
+                                                    ui.label(RichText::new("私钥路径 *").color(p.dim));
+                                                    ui.horizontal(|ui| {
+                                                        ui.add(
+                                                            egui::TextEdit::singleline(identity_file)
+                                                                .hint_text("选择私钥文件；免密私钥连接时不再弹窗")
+                                                                .desired_width(272.0),
+                                                        );
+                                                        if ui.button("浏览…").clicked() {
+                                                            if let Some(path) = rfd::FileDialog::new().pick_file() {
+                                                                *identity_file = path.to_string_lossy().to_string();
+                                                            }
+                                                        }
+                                                    });
+                                                    ui.end_row();
+                                                }
 
                                                 ui.label(RichText::new("远端路径").color(p.dim));
                                                 ui.add(
@@ -5913,7 +6050,11 @@ impl KwDesktopApp {
                                         } else {
                                             username.trim().to_string()
                                         };
-                                        let idf_val = identity_file.trim().to_string();
+                                        let idf_val = if auth_method.trim() == "password" {
+                                            String::new()
+                                        } else {
+                                            identity_file.trim().to_string()
+                                        };
                                         let rp_val = remote_path.trim().to_string();
                                         let p_on = *proxy_enabled;
                                         let p_kind = proxy_kind.clone();
@@ -5923,6 +6064,9 @@ impl KwDesktopApp {
                                         let p_pw = proxy_password.clone();
                                         let p_remember = *remember_proxy_password;
                                         let p_was_saved = *proxy_pw_saved;
+                                        let login_pw = password.clone();
+                                        let auth_val = auth_method.trim().to_string();
+                                        let data_dir = self.data_dir.clone();
 
                                         ui.horizontal(|ui| {
                                             if let Some(exist_id) = id_clone.as_ref() {
@@ -5936,6 +6080,8 @@ impl KwDesktopApp {
                                                 .clicked()
                                                 {
                                                     let _ = self.engine.delete_host(exist_id);
+                                                    write_login_pw(&data_dir, exist_id, None);
+                                                    write_auth_method(&data_dir, exist_id, None);
                                                     self.reload_store_data();
                                                     self.push_log(
                                                         "已删除服务器配置",
@@ -5951,6 +6097,8 @@ impl KwDesktopApp {
                                                         host.clear();
                                                         *port = "22".to_string();
                                                         *username = "root".to_string();
+                                                        *auth_method = "password".to_string();
+                                                        password.clear();
                                                         identity_file.clear();
                                                         *proxy_enabled = false;
                                                         *proxy_expanded = false;
@@ -6022,6 +6170,18 @@ impl KwDesktopApp {
                                                                         *id = Some(
                                                                             new_id.to_string(),
                                                                         );
+                                                                        // 认证方式 + 登录密码写入本机独立文件；
+                                                                        // 密钥登录不留密码，密码登录不留私钥路径。
+                                                                        write_auth_method(&data_dir, new_id, Some(auth_val.as_str()));
+                                                                        write_login_pw(
+                                                                            &data_dir,
+                                                                            new_id,
+                                                                            if auth_val == "password" && !login_pw.is_empty() {
+                                                                                Some(login_pw.as_str())
+                                                                            } else {
+                                                                                None
+                                                                            },
+                                                                        );
                                                                         // 代理密码只在勾选「本机记住」时落盘；
                                                                         // 取消勾选或关闭代理都会清掉旧密码。
                                                                         let pw_action = if !p_on {
@@ -6087,6 +6247,15 @@ impl KwDesktopApp {
                         });
 
                         if let Some(target) = switch_to {
+                            let saved_login_pw = read_login_pw(&self.data_dir, &target.id);
+                            let saved_method = read_auth_method(&self.data_dir, &target.id)
+                                .unwrap_or_else(|| {
+                                    if target.identity_file.trim().is_empty() {
+                                        "password".to_string()
+                                    } else {
+                                        "key".to_string()
+                                    }
+                                });
                             let pw_saved = self.engine.proxy_password_saved(&target.id);
                             let proxy_on = target.proxy_enabled();
                             let proxy_port_num = target.proxy_port_or_default();
@@ -6095,6 +6264,8 @@ impl KwDesktopApp {
                             *host = target.host;
                             *port = target.port.to_string();
                             *username = target.username;
+                            *auth_method = saved_method;
+                            *password = saved_login_pw.unwrap_or_default();
                             *identity_file = target.identity_file;
                             *remote_path = target.remote_path;
                             *proxy_enabled = proxy_on;
@@ -6190,27 +6361,42 @@ impl KwDesktopApp {
                             ui.add_space(8.0);
                         }
 
-                        ui.label(
-                            RichText::new("SSH 登录密码（若使用免密私钥可留空）：")
-                                .size(12.0)
-                                .color(p.dim),
-                        );
-                        let pw_resp = ui.add(
-                            egui::TextEdit::singleline(password)
-                                .password(true)
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new("私钥解密口令（若私钥无加密可留空）：")
-                                .size(12.0)
-                                .color(p.dim),
-                        );
-                        let pp_resp = ui.add(
-                            egui::TextEdit::singleline(passphrase)
-                                .password(true)
-                                .desired_width(f32::INFINITY),
-                        );
+                        let auth_kind = read_auth_method(&self.data_dir, &host.id).unwrap_or_default();
+                        let mut pw_resp = None;
+                        let mut pp_resp = None;
+                        if auth_kind.is_empty() {
+                            // 旧配置（没选过认证方式）：保留原来的双输入框兼容
+                            ui.label(
+                                RichText::new("SSH 登录密码（若使用免密私钥可留空）：")
+                                    .size(12.0)
+                                    .color(p.dim),
+                            );
+                            pw_resp = Some(ui.add(
+                                egui::TextEdit::singleline(password)
+                                    .password(true)
+                                    .desired_width(f32::INFINITY),
+                            ));
+                        }
+                        if auth_kind.is_empty() || auth_kind == "key" {
+                            ui.add_space(6.0);
+                            ui.label(
+                                RichText::new("私钥解密口令（这把私钥已加密）：")
+                                    .size(12.0)
+                                    .color(p.dim),
+                            );
+                            pp_resp = Some(ui.add(
+                                egui::TextEdit::singleline(passphrase)
+                                    .password(true)
+                                    .desired_width(f32::INFINITY),
+                            ));
+                        }
+                        if auth_kind == "password" {
+                            ui.label(
+                                RichText::new("使用已保存的登录密码直接连接，无需再次输入")
+                                    .size(11.5)
+                                    .color(p.dim),
+                            );
+                        }
 
                         let proxy_needs_password = host.proxy_enabled()
                             && !host.proxy_username.trim().is_empty()
@@ -6236,8 +6422,14 @@ impl KwDesktopApp {
                             ));
                         }
 
-                        let enter_pressed = (pw_resp.lost_focus()
-                            || pp_resp.lost_focus()
+                        let enter_pressed = (pw_resp
+                            .as_ref()
+                            .map(|r| r.lost_focus())
+                            .unwrap_or(false)
+                            || pp_resp
+                                .as_ref()
+                                .map(|r| r.lost_focus())
+                                .unwrap_or(false)
                             || proxy_pw_resp
                                 .as_ref()
                                 .map(|r| r.lost_focus())
@@ -8339,4 +8531,75 @@ fn setup_fonts(ctx: &egui::Context) {
     }
 
     ctx.set_fonts(fonts);
+}
+
+#[cfg(test)]
+mod login_pw_tests {
+    use super::*;
+
+    #[test]
+    fn login_password_roundtrip_stays_out_of_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert_eq!(read_login_pw(p, "host-1"), None);
+        write_login_pw(p, "host-1", Some("s3cret"));
+        assert_eq!(read_login_pw(p, "host-1").as_deref(), Some("s3cret"));
+        assert!(!p.join("config.json").exists(), "密码绝不能写进 config.json");
+        assert!(login_pw_file(p).exists());
+        write_login_pw(p, "host-1", None);
+        assert_eq!(read_login_pw(p, "host-1"), None);
+        assert!(!login_pw_file(p).exists(), "清空后删掉文件，不留空壳");
+    }
+
+    #[test]
+    fn empty_password_is_never_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_login_pw(dir.path(), "h", Some(""));
+        assert_eq!(read_login_pw(dir.path(), "h"), None);
+        assert!(!login_pw_file(dir.path()).exists());
+    }
+
+    #[test]
+    fn multiple_hosts_are_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_login_pw(dir.path(), "a", Some("pw-a"));
+        write_login_pw(dir.path(), "b", Some("pw-b"));
+        assert_eq!(read_login_pw(dir.path(), "a").as_deref(), Some("pw-a"));
+        write_login_pw(dir.path(), "a", None);
+        assert_eq!(read_login_pw(dir.path(), "a"), None);
+        assert_eq!(read_login_pw(dir.path(), "b").as_deref(), Some("pw-b"));
+    }
+}
+
+#[cfg(test)]
+mod auth_method_tests {
+    use super::*;
+
+    #[test]
+    fn auth_method_roundtrip_is_isolated_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert_eq!(read_auth_method(p, "h1"), None);
+        write_auth_method(p, "h1", Some("key"));
+        assert_eq!(read_auth_method(p, "h1").as_deref(), Some("key"));
+        assert!(!p.join("config.json").exists());
+        assert!(!login_pw_file(p).exists(), "认证方式与密码是两份独立文件");
+        write_auth_method(p, "h1", Some("junk"));
+        assert_eq!(read_auth_method(p, "h1"), None);
+        assert!(!auth_method_file(p).exists());
+    }
+
+    #[test]
+    fn encrypted_key_needs_passphrase_plain_key_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = kw_keys::keygen::generate_ed25519(None, None).unwrap();
+        let locked = kw_keys::keygen::generate_ed25519(None, Some("s3cret")).unwrap();
+        let p1 = dir.path().join("plain.pem");
+        let p2 = dir.path().join("locked.pem");
+        std::fs::write(&p1, &plain.private_key_pem).unwrap();
+        std::fs::write(&p2, &locked.private_key_pem).unwrap();
+        assert!(!private_key_needs_passphrase(p1.to_str().unwrap()));
+        assert!(private_key_needs_passphrase(p2.to_str().unwrap()));
+        assert!(!private_key_needs_passphrase("Z:/definitely-missing.pem"));
+    }
 }
