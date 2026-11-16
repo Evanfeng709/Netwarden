@@ -56,7 +56,7 @@ class _MobileShellState extends State<MobileShell> {
           children: [
             Icon(Icons.vpn_key_rounded, color: KwColors.accent, size: 17),
             const SizedBox(width: 7),
-            const Text('SSH Keywarden'),
+            const Text('Netwarden'),
             const SizedBox(width: 7),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
@@ -92,10 +92,16 @@ class _MobileShellState extends State<MobileShell> {
               ),
             ),
           IconButton(
-            tooltip: '外观主题',
+            tooltip: '外观主题（当前：${KwColors.palette.name}）',
             visualDensity: VisualDensity.compact,
             onPressed: _openPalettes,
-            icon: Icon(Icons.palette_outlined, size: 19, color: KwColors.dim),
+            icon: Icon(
+              KwColors.palette.isDark
+                  ? Icons.dark_mode_rounded
+                  : Icons.light_mode_rounded,
+              size: 19,
+              color: KwColors.dim,
+            ),
           ),
           if (state.busy)
             const Padding(

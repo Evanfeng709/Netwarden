@@ -31,10 +31,10 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-pub const PALETTES: [Palette; 6] = [
+pub const PALETTES: [Palette; 2] = [
     Palette {
         id: "obsidian",
-        name: "曜石 (Termius)",
+        name: "曜石",
         dark: true,
         bg: rgb(0x0B, 0x0D, 0x12),
         bg_elev: rgb(0x10, 0x14, 0x1D),
@@ -53,72 +53,6 @@ pub const PALETTES: [Palette; 6] = [
         warn_soft: rgb(0x2A, 0x24, 0x18),
         danger: rgb(0xF8, 0x51, 0x49),
         danger_soft: rgb(0x2A, 0x16, 0x18),
-    },
-    Palette {
-        id: "midnight",
-        name: "午夜",
-        dark: true,
-        bg: rgb(0x0A, 0x10, 0x20),
-        bg_elev: rgb(0x10, 0x1A, 0x2E),
-        panel: rgb(0x0E, 0x17, 0x28),
-        surface2: rgb(0x0B, 0x13, 0x22),
-        surface3: rgb(0x17, 0x23, 0x3A),
-        border: rgb(0x22, 0x30, 0x4A),
-        text: rgb(0xE4, 0xEC, 0xF8),
-        dim: rgb(0x97, 0xA8, 0xC0),
-        faint: rgb(0x64, 0x74, 0x8F),
-        accent: rgb(0x6A, 0xA6, 0xFF),
-        accent_soft: rgb(0x17, 0x27, 0x4A),
-        ok: rgb(0x41, 0xC4, 0x83),
-        ok_soft: rgb(0x12, 0x2A, 0x22),
-        warn: rgb(0xDF, 0xA8, 0x3C),
-        warn_soft: rgb(0x2C, 0x25, 0x18),
-        danger: rgb(0xF0, 0x6F, 0x67),
-        danger_soft: rgb(0x2E, 0x18, 0x1C),
-    },
-    Palette {
-        id: "graphite",
-        name: "石墨",
-        dark: true,
-        bg: rgb(0x16, 0x17, 0x1A),
-        bg_elev: rgb(0x1E, 0x20, 0x24),
-        panel: rgb(0x1A, 0x1C, 0x20),
-        surface2: rgb(0x14, 0x15, 0x18),
-        surface3: rgb(0x25, 0x28, 0x2E),
-        border: rgb(0x2E, 0x31, 0x38),
-        text: rgb(0xE3, 0xE5, 0xEA),
-        dim: rgb(0x9E, 0xA3, 0xAE),
-        faint: rgb(0x6E, 0x73, 0x7E),
-        accent: rgb(0x6A, 0x9F, 0xF5),
-        accent_soft: rgb(0x20, 0x2B, 0x40),
-        ok: rgb(0x4A, 0xBE, 0x82),
-        ok_soft: rgb(0x1A, 0x2B, 0x23),
-        warn: rgb(0xD4, 0xA0, 0x3D),
-        warn_soft: rgb(0x2D, 0x27, 0x1B),
-        danger: rgb(0xE0, 0x6A, 0x62),
-        danger_soft: rgb(0x2F, 0x1D, 0x1D),
-    },
-    Palette {
-        id: "cloud",
-        name: "云白",
-        dark: false,
-        bg: rgb(0xF5, 0xF7, 0xFA),
-        bg_elev: rgb(0xFF, 0xFF, 0xFF),
-        panel: rgb(0xFF, 0xFF, 0xFF),
-        surface2: rgb(0xEE, 0xF1, 0xF6),
-        surface3: rgb(0xE6, 0xEA, 0xF1),
-        border: rgb(0xDC, 0xE1, 0xEA),
-        text: rgb(0x1C, 0x22, 0x2B),
-        dim: rgb(0x55, 0x60, 0x70),
-        faint: rgb(0x88, 0x92, 0xA2),
-        accent: rgb(0x25, 0x63, 0xEB),
-        accent_soft: rgb(0xE6, 0xEE, 0xFD),
-        ok: rgb(0x15, 0x80, 0x3D),
-        ok_soft: rgb(0xE3, 0xF5, 0xEA),
-        warn: rgb(0xB4, 0x53, 0x09),
-        warn_soft: rgb(0xFB, 0xF0, 0xDC),
-        danger: rgb(0xDC, 0x26, 0x26),
-        danger_soft: rgb(0xFC, 0xE8, 0xE8),
     },
     Palette {
         id: "linen",
@@ -142,64 +76,25 @@ pub const PALETTES: [Palette; 6] = [
         danger: rgb(0xC9, 0x34, 0x2D),
         danger_soft: rgb(0xF8, 0xE3, 0xE1),
     },
-    Palette {
-        id: "mist",
-        name: "雾青",
-        dark: false,
-        bg: rgb(0xEE, 0xF3, 0xF4),
-        bg_elev: rgb(0xF9, 0xFC, 0xFC),
-        panel: rgb(0xF7, 0xFA, 0xFB),
-        surface2: rgb(0xE5, 0xEC, 0xEE),
-        surface3: rgb(0xDC, 0xE5, 0xE8),
-        border: rgb(0xCE, 0xD9, 0xDD),
-        text: rgb(0x1B, 0x26, 0x2B),
-        dim: rgb(0x4F, 0x61, 0x68),
-        faint: rgb(0x7E, 0x90, 0x97),
-        accent: rgb(0x19, 0x67, 0x85),
-        accent_soft: rgb(0xDC, 0xEE, 0xF4),
-        ok: rgb(0x1C, 0x7C, 0x54),
-        ok_soft: rgb(0xDE, 0xF1, 0xE8),
-        warn: rgb(0xAA, 0x62, 0x12),
-        warn_soft: rgb(0xF5, 0xEB, 0xD7),
-        danger: rgb(0xC7, 0x38, 0x38),
-        danger_soft: rgb(0xF8, 0xE3, 0xE3),
-    },
 ];
 
-pub const THEME_CHOICES: [(&str, &str); 8] = [
-    ("obsidian", "曜石 (Termius)"),
-    ("midnight", "午夜"),
-    ("graphite", "石墨"),
-    ("cloud", "云白"),
+pub const THEME_CHOICES: [(&str, &str); 2] = [
+    ("obsidian", "曜石"),
     ("linen", "亚麻"),
-    ("mist", "雾青"),
-    ("auto", "跟随系统 (曜石/云白)"),
-    ("auto-soft", "跟随系统柔和 (石墨/亚麻)"),
 ];
 
 pub fn resolve_palette(choice: &str, system_dark: bool) -> Palette {
-    let id = match choice {
-        "auto" => {
+    match choice {
+        "linen" => PALETTES[1],
+        "obsidian" => PALETTES[0],
+        _ => {
             if system_dark {
-                "obsidian"
+                PALETTES[0]
             } else {
-                "cloud"
+                PALETTES[1]
             }
         }
-        "auto-soft" => {
-            if system_dark {
-                "graphite"
-            } else {
-                "linen"
-            }
-        }
-        other => other,
-    };
-    PALETTES
-        .iter()
-        .copied()
-        .find(|p| p.id == id)
-        .unwrap_or(PALETTES[0])
+    }
 }
 
 pub fn apply_palette(ctx: &egui::Context, p: &Palette) {

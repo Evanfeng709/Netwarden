@@ -1,4 +1,4 @@
-# SSH Keywarden（Rust 版）
+# Netwarden（Rust 版）
 
 本地 SSH 授权密钥管理台 —— 用来打理服务器上的 `~/.ssh/authorized_keys`：
 看清每把钥匙是谁的、给新设备加一把、把旧钥匙换掉、把不用的删掉。
@@ -42,7 +42,7 @@ cargo run -p kw-server -- --no-open
 
 # 发布构建
 cargo build --release          # → target/release/kw-desktop.exe
-makensis -INPUTCHARSET UTF8 scripts\installer.nsi  # → target/release/bundle/nsis/SSH Keywarden_<ver>_x64-setup.exe
+makensis -INPUTCHARSET UTF8 scripts\installer.nsi  # → target/release/bundle/nsis/Netwarden_<ver>_x64-setup.exe
 
 # 手机端动态库（Android .so / iOS .a 由各自工具链再交叉编译）
 cargo build -p kw-ffi --release

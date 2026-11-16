@@ -452,7 +452,7 @@ fn encrypt_bundle(plain: &[u8], pass: &str) -> Result<String, String> {
 fn decode_sync_bundle(text: &str, passphrase: Option<&str>) -> Result<SyncBundle, String> {
     let env: Value = serde_json::from_str(text).map_err(|_| "同步包不是合法 JSON".to_string())?;
     if env.get("format").and_then(Value::as_str) != Some(SYNC_FORMAT) {
-        return Err("不是 SSH Keywarden 同步包".to_string());
+        return Err("不是 Netwarden 同步包".to_string());
     }
     let version = env
         .get("version")

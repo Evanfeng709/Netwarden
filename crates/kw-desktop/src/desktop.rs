@@ -6,18 +6,20 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 
 /// 与旧版 `electron/main.js` 的 THEME_CHOICES 一致
-pub const THEMES: [&str; 8] = [
+pub const THEMES: [&str; 2] = [
     "obsidian",
-    "midnight",
-    "graphite",
-    "cloud",
     "linen",
-    "mist",
-    "auto",
-    "auto-soft",
 ];
 
-const DATA_FILES: [&str; 3] = ["config.json", "known_hosts.json", "key-notes.json"];
+const DATA_FILES: [&str; 6] = [
+    "config.json",
+    "known_hosts.json",
+    "key-notes.json",
+    "theme.json",
+    "ui.json",
+    "window.json",
+];
+
 
 #[allow(dead_code)]
 pub const DEFAULT_WIDTH: u32 = 1280;
@@ -35,22 +37,32 @@ pub fn default_ui() -> Value {
 /* 数据目录                                                            */
 /* ------------------------------------------------------------------ */
 
-/// `KW_DATA_DIR` 优先；否则与旧 Electron 版同址：
-/// `%APPDATA%\ssh-keywarden\data`。
+/// `NW_DATA_DIR` 或 `KW_DATA_DIR` 优先；否则取 `%APPDATA%\netwarden\data`。
+/// 若检测到旧版 `%APPDATA%\ssh-keywarden\data` 且新目录不存在，将自动迁移。
 pub fn resolve_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("KW_DATA_DIR") {
+    if let Some(dir) = std::env::var_os("NW_DATA_DIR").or_else(|| std::env::var_os("KW_DATA_DIR")) {
         return PathBuf::from(dir);
     }
     if let Some(base) = std::env::var_os("APPDATA") {
-        return PathBuf::from(base).join("ssh-keywarden").join("data");
+        let nw_dir = PathBuf::from(&base).join("netwarden").join("data");
+        let legacy = PathBuf::from(&base).join("ssh-keywarden").join("data");
+        if !nw_dir.exists() && legacy.exists() {
+            migrate_data(&nw_dir, &legacy);
+        }
+        return nw_dir;
     }
     if let Some(home) = std::env::var_os("HOME") {
-        return PathBuf::from(home).join(".ssh-keywarden");
+        let nw_dir = PathBuf::from(&home).join(".netwarden");
+        let legacy = PathBuf::from(&home).join(".ssh-keywarden");
+        if !nw_dir.exists() && legacy.exists() {
+            migrate_data(&nw_dir, &legacy);
+        }
+        return nw_dir;
     }
     PathBuf::from("data")
 }
 
-/// 目标目录还没有 config.json 时，从安装目录旁的 `data` 复制三个数据文件。
+/// 目标目录还没有 config.json 时，从候选目录迁移数据文件。
 pub fn migrate_data(target: &Path, candidate: &Path) {
     if target.join("config.json").exists() || !candidate.join("config.json").exists() {
         return;
@@ -61,10 +73,9 @@ pub fn migrate_data(target: &Path, candidate: &Path) {
     let _ = fs::create_dir_all(target);
     for name in DATA_FILES {
         let from = candidate.join(name);
-        if !from.is_file() {
-            continue;
+        if from.is_file() {
+            let _ = fs::copy(&from, target.join(name));
         }
-        let _ = fs::copy(&from, target.join(name));
     }
 }
 
@@ -98,6 +109,12 @@ pub fn save_theme(data_dir: &Path, choice: &str) -> Result<(), String> {
         .map_err(|e| format!("无法保存主题：{e}"))
 }
 
+/// 读取 `ui.json`。
+///
+/// 目前**只写不读**：开屏固定落在「主机与密钥」页（终端 / 文件 / 监控都依附 SSH 会话，
+/// 冷启动没有会话，恢复上次页面只会露出空面板）。保留这个读取器是为了以后真要
+/// 做「同一次运行内恢复布局」时不必重新解析格式，故标 dead_code。
+#[allow(dead_code)]
 pub fn read_ui(data_dir: &Path) -> Value {
     let raw = fs::read_to_string(data_dir.join("ui.json")).unwrap_or_default();
     let value: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);

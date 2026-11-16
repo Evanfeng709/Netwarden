@@ -10,6 +10,9 @@ class HostConfig {
     required this.username,
     required this.identityFile,
     required this.remotePath,
+    this.proxyKind = '',
+    this.proxyHost = '',
+    this.proxyPort = 1080,
   });
 
   final String id;
@@ -19,9 +22,13 @@ class HostConfig {
   final String username;
   final String identityFile;
   final String remotePath;
+  final String proxyKind;
+  final String proxyHost;
+  final int proxyPort;
 
   String get label => name.isEmpty ? host : name;
   String get endpoint => '$username@$host:$port';
+  bool get hasProxy => proxyKind.isNotEmpty;
 
   factory HostConfig.fromJson(Map<String, dynamic> json) => HostConfig(
     id: json['id']?.toString() ?? '',
@@ -34,6 +41,9 @@ class HostConfig {
         json['identity_file']?.toString() ??
         '',
     remotePath: json['remotePath']?.toString() ?? '',
+    proxyKind: json['proxyKind']?.toString() ?? '',
+    proxyHost: json['proxyHost']?.toString() ?? '',
+    proxyPort: (json['proxyPort'] as num?)?.toInt() ?? 1080,
   );
 }
 

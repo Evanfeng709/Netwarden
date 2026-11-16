@@ -165,7 +165,7 @@ pub fn normalize_comment(comment: &str) -> String {
 fn comment_or_default(comment: Option<&str>) -> String {
     let c = normalize_comment(comment.unwrap_or(""));
     if c.is_empty() {
-        "ssh-keywarden".to_string()
+        "netwarden".to_string()
     } else {
         c
     }
@@ -423,8 +423,8 @@ mod tests {
         assert_eq!(normalize_comment("  alice@laptop \n\t "), "alice@laptop");
         assert_eq!(normalize_comment("a  b\tc"), "a_b_c");
         assert_eq!(normalize_comment(&"x".repeat(100)).chars().count(), 80);
-        assert_eq!(comment_or_default(None), "ssh-keywarden");
-        assert_eq!(comment_or_default(Some("   ")), "ssh-keywarden");
+        assert_eq!(comment_or_default(None), "netwarden");
+        assert_eq!(comment_or_default(Some("   ")), "netwarden");
     }
 
     #[test]

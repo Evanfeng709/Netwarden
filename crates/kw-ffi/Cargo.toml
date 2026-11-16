@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "SSH Keywarden 手机端（Flutter）调用的 Rust 门面"
+description = "Netwarden 手机端（Flutter）调用的 Rust 门面"
 
 [lib]
 # cdylib 给 Android/iOS 动态库，staticlib 给 iOS 静态链接，rlib 给 Rust 测试

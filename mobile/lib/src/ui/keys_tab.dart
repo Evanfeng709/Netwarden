@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../app_state.dart';
 import '../kw_ffi.dart';
@@ -24,9 +25,47 @@ class KeysTab extends StatefulWidget {
 
 class _KeysTabState extends State<KeysTab> {
   String? _hostId;
+  final TextEditingController _search = TextEditingController();
 
   AppState get state => widget.state;
   Bootstrap? get bootstrap => state.bootstrap;
+
+  @override
+  void dispose() {
+    _search.dispose();
+    super.dispose();
+  }
+
+  static List<String> _extractTags(HostConfig h) {
+    final tags = <String>[];
+    final ip = h.host.trim();
+    if (ip.startsWith('192.168.') ||
+        ip.startsWith('10.') ||
+        ip.startsWith('127.') ||
+        ip.startsWith('172.16.') ||
+        ip.startsWith('172.17.') ||
+        ip.startsWith('172.18.') ||
+        ip.startsWith('172.19.') ||
+        ip.startsWith('172.2') ||
+        ip.startsWith('172.30.') ||
+        ip.startsWith('172.31.')) {
+      tags.add('局域网');
+    }
+    final lower = '${h.name} ${h.host}'.toLowerCase();
+    if (lower.contains('fnos') || lower.contains('nas') || lower.contains('存储')) {
+      tags.add('NAS');
+    }
+    if (lower.contains('singapore') || lower.contains('sg') || lower.contains('新加坡')) {
+      tags.add('新加坡');
+    } else if (lower.contains('hongkong') || lower.contains('hk') || lower.contains('香港')) {
+      tags.add('香港');
+    } else if (lower.contains('japan') || lower.contains('jp') || lower.contains('tokyo') || lower.contains('日本')) {
+      tags.add('日本');
+    } else if (lower.contains('us') || lower.contains('usa') || lower.contains('america') || lower.contains('美国')) {
+      tags.add('美国');
+    }
+    return tags;
+  }
 
   HostConfig? get _selectedHost {
     final hosts = bootstrap?.hosts ?? <HostConfig>[];
@@ -220,8 +259,20 @@ class _KeysTabState extends State<KeysTab> {
 
   Widget _disconnected(HostConfig? host) {
     final hosts = bootstrap?.hosts ?? <HostConfig>[];
+    final q = _search.text.trim().toLowerCase();
+    final filteredHosts = q.isEmpty
+        ? hosts
+        : hosts
+            .where(
+              (h) =>
+                  h.label.toLowerCase().contains(q) ||
+                  h.host.toLowerCase().contains(q) ||
+                  h.username.toLowerCase().contains(q),
+            )
+            .toList();
+
     return ListView(
-      padding: EdgeInsets.all(14),
+      padding: const EdgeInsets.all(14),
       children: [
         if (hosts.isEmpty)
           panel(
@@ -236,7 +287,7 @@ class _KeysTabState extends State<KeysTab> {
                     color: KwColors.text,
                   ),
                 ),
-                SizedBox(height: 8),
+                const SizedBox(height: 8),
                 Text(
                   '手机端不读 ~/.ssh/config。可以手填主机，或在「密钥包·同步」登录微软账号，把桌面端的密钥库拉下来。',
                   style: TextStyle(
@@ -245,19 +296,19 @@ class _KeysTabState extends State<KeysTab> {
                     color: KwColors.dim,
                   ),
                 ),
-                SizedBox(height: 14),
+                const SizedBox(height: 14),
                 Row(
                   children: [
                     FilledButton.icon(
                       onPressed: _addHost,
-                      icon: Icon(Icons.add_rounded, size: 16),
-                      label: Text('添加主机', style: TextStyle(fontSize: 13)),
+                      icon: const Icon(Icons.add_rounded, size: 16),
+                      label: const Text('添加主机', style: TextStyle(fontSize: 13)),
                     ),
-                    SizedBox(width: 10),
+                    const SizedBox(width: 10),
                     OutlinedButton.icon(
                       onPressed: widget.onOpenSync,
-                      icon: Icon(Icons.cloud_sync_rounded, size: 16),
-                      label: Text('云同步', style: TextStyle(fontSize: 13)),
+                      icon: const Icon(Icons.cloud_sync_rounded, size: 16),
+                      label: const Text('云同步', style: TextStyle(fontSize: 13)),
                     ),
                   ],
                 ),
@@ -265,12 +316,45 @@ class _KeysTabState extends State<KeysTab> {
             ),
           )
         else ...[
+          // 搜索框
+          Container(
+            height: 38,
+            margin: const EdgeInsets.only(bottom: 12),
+            child: TextField(
+              controller: _search,
+              style: TextStyle(fontSize: 13, color: KwColors.text),
+              decoration: InputDecoration(
+                hintText: '筛选主机名称、IP 或用户名...',
+                hintStyle: TextStyle(fontSize: 12, color: KwColors.faint),
+                prefixIcon:
+                    Icon(Icons.search_rounded, size: 17, color: KwColors.dim),
+                suffixIcon: _search.text.isNotEmpty
+                    ? IconButton(
+                        icon: Icon(
+                          Icons.close_rounded,
+                          size: 16,
+                          color: KwColors.dim,
+                        ),
+                        onPressed: () => setState(() => _search.clear()),
+                      )
+                    : null,
+                contentPadding:
+                    const EdgeInsets.symmetric(horizontal: 10, vertical: 0),
+                isDense: true,
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(8),
+                  borderSide: BorderSide(color: KwColors.border),
+                ),
+              ),
+              onChanged: (_) => setState(() {}),
+            ),
+          ),
           Padding(
-            padding: EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.only(bottom: 8),
             child: Row(
               children: [
                 Text(
-                  '主机库 (${hosts.length})',
+                  '服务器保险库 (${filteredHosts.length}${q.isNotEmpty ? ' / ${hosts.length}' : ''})',
                   style: TextStyle(
                     fontSize: 11.5,
                     fontWeight: FontWeight.w700,
@@ -278,14 +362,15 @@ class _KeysTabState extends State<KeysTab> {
                     color: KwColors.dim,
                   ),
                 ),
-                Spacer(),
+                const Spacer(),
                 InkWell(
                   onTap: _addHost,
                   borderRadius: BorderRadius.circular(6),
                   child: Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                     child: Text(
-                      '+ 新增主机',
+                      '+ 添加主机',
                       style: TextStyle(
                         fontSize: 12,
                         fontWeight: FontWeight.w600,
@@ -297,14 +382,25 @@ class _KeysTabState extends State<KeysTab> {
               ],
             ),
           ),
-          ...hosts.map(
-            (h) => Padding(
-              padding: EdgeInsets.only(bottom: 10),
-              child: _hostVaultCard(h, isSelected: h.id == host?.id),
+          if (filteredHosts.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 24),
+              child: Center(
+                child: Text(
+                  '未找到匹配的主机',
+                  style: TextStyle(fontSize: 12.5, color: KwColors.faint),
+                ),
+              ),
+            )
+          else
+            ...filteredHosts.map(
+              (h) => Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: _hostVaultCard(h, isSelected: h.id == host?.id),
+              ),
             ),
-          ),
         ],
-        SizedBox(height: 6),
+        const SizedBox(height: 6),
         panel(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -317,7 +413,7 @@ class _KeysTabState extends State<KeysTab> {
                   color: KwColors.text,
                 ),
               ),
-              SizedBox(height: 8),
+              const SizedBox(height: 8),
               Text(
                 '查看 / 搜索 / 备注服务器上的每把钥匙，生成并追加新钥匙，三步式更换，'
                 '多选删除，备份差异与恢复，以及切换「仅密钥登录」。'
@@ -340,14 +436,19 @@ class _KeysTabState extends State<KeysTab> {
     final keyBadge = hasKey
         ? h.identityFile.split(RegExp(r'[/\\]')).last
         : '密码登录';
+    final isNas = h.label.toUpperCase().contains('FNOS') ||
+        h.label.toUpperCase().contains('NAS') ||
+        h.label.contains('存储');
+    final tags = _extractTags(h);
+
     return Container(
-      padding: EdgeInsets.all(13),
+      padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
         color: KwColors.panel,
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
           color: isSelected
-              ? KwColors.accent.withValues(alpha: 0.55)
+              ? KwColors.accent.withValues(alpha: 0.6)
               : KwColors.border,
         ),
       ),
@@ -356,92 +457,261 @@ class _KeysTabState extends State<KeysTab> {
         children: [
           Row(
             children: [
-              Container(
-                width: 34,
-                height: 34,
-                decoration: BoxDecoration(
-                  color: KwColors.accentSoft,
-                  borderRadius: BorderRadius.circular(9),
-                  border: Border.all(
-                    color: KwColors.accent.withValues(alpha: 0.35),
+              // 智能头像 + 在线指示灯
+              Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Container(
+                    width: 38,
+                    height: 38,
+                    decoration: BoxDecoration(
+                      color: KwColors.accentSoft,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(
+                        color: KwColors.accent.withValues(alpha: 0.35),
+                      ),
+                    ),
+                    alignment: Alignment.center,
+                    child: isNas
+                        ? Icon(
+                            Icons.storage_rounded,
+                            size: 19,
+                            color: KwColors.accent,
+                          )
+                        : (h.label.isNotEmpty &&
+                                RegExp(r'^[a-zA-Z0-9]').hasMatch(h.label))
+                            ? Text(
+                                h.label[0].toUpperCase(),
+                                style: TextStyle(
+                                  fontSize: 16,
+                                  fontWeight: FontWeight.w700,
+                                  color: KwColors.accent,
+                                ),
+                              )
+                            : Icon(
+                                Icons.dns_rounded,
+                                size: 18,
+                                color: KwColors.accent,
+                              ),
                   ),
-                ),
-                alignment: Alignment.center,
-                child: Icon(
-                  Icons.dns_rounded,
-                  size: 17,
-                  color: KwColors.accent,
-                ),
+                  Positioned(
+                    right: -1,
+                    bottom: -1,
+                    child: Container(
+                      width: 9,
+                      height: 9,
+                      decoration: BoxDecoration(
+                        color: KwColors.ok,
+                        shape: BoxShape.circle,
+                        border: Border.all(color: KwColors.panel, width: 1.5),
+                      ),
+                    ),
+                  ),
+                ],
               ),
-              SizedBox(width: 10),
+              const SizedBox(width: 10),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Text(
-                      h.label,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.w600,
-                        color: KwColors.text,
-                      ),
+                    Row(
+                      children: [
+                        Flexible(
+                          child: Text(
+                            h.label,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 14.5,
+                              fontWeight: FontWeight.w600,
+                              color: KwColors.text,
+                            ),
+                          ),
+                        ),
+                        for (final tag in tags) ...[
+                          const SizedBox(width: 5),
+                          chip(
+                            tag,
+                            color: KwColors.accent,
+                            background: KwColors.accentSoft,
+                          ),
+                        ],
+                      ],
                     ),
-                    SizedBox(height: 2),
-                    Text(
-                      h.endpoint,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontFamily: 'monospace',
-                        color: KwColors.dim,
+                    const SizedBox(height: 3),
+                    InkWell(
+                      onTap: () {
+                        HapticFeedback.lightImpact();
+                        copyText(context, h.endpoint, '主机地址');
+                      },
+                      borderRadius: BorderRadius.circular(4),
+                      child: Padding(
+                        padding: const EdgeInsets.symmetric(vertical: 1),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                h.endpoint,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontFamily: 'monospace',
+                                  color: KwColors.dim,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            Icon(
+                              Icons.copy_rounded,
+                              size: 11,
+                              color: KwColors.faint,
+                            ),
+                          ],
+                        ),
                       ),
                     ),
                   ],
                 ),
               ),
-              chip(
-                hasKey ? '🗝️ $keyBadge' : '🔒 $keyBadge',
-                color: hasKey ? KwColors.ok : KwColors.dim,
-                background: hasKey ? KwColors.okSoft : KwColors.surface3,
+              IconButton(
+                tooltip: '编辑配置',
+                visualDensity: VisualDensity.compact,
+                padding: EdgeInsets.zero,
+                constraints:
+                    const BoxConstraints(minWidth: 30, minHeight: 30),
+                icon:
+                    Icon(Icons.edit_outlined, size: 16, color: KwColors.dim),
+                onPressed: () => _showHostDialog(initial: h),
+              ),
+              PopupMenuButton<String>(
+                icon: Icon(
+                  Icons.more_vert_rounded,
+                  size: 17,
+                  color: KwColors.dim,
+                ),
+                color: KwColors.bgElev,
+                padding: EdgeInsets.zero,
+                constraints:
+                    const BoxConstraints(minWidth: 28, minHeight: 28),
+                onSelected: (v) async {
+                  if (v == 'copy') {
+                    copyText(context, h.endpoint, '主机地址');
+                  } else if (v == 'edit') {
+                    _showHostDialog(initial: h);
+                  } else if (v == 'delete') {
+                    final ok = await confirm(
+                      context,
+                      title: '删除主机',
+                      message:
+                          '确定要删除主机「${h.label}」吗？只删本机配置，不会动服务器钥匙。',
+                      danger: true,
+                      confirmText: '删除',
+                    );
+                    if (!ok) return;
+                    try {
+                      await state.deleteHost(h.id);
+                    } catch (e) {
+                      if (mounted) showError(context, e);
+                    }
+                  }
+                },
+                itemBuilder: (ctx) => [
+                  const PopupMenuItem(
+                    value: 'copy',
+                    child: Row(
+                      children: [
+                        Icon(Icons.copy_rounded, size: 15),
+                        SizedBox(width: 8),
+                        Text('复制地址', style: TextStyle(fontSize: 12.5)),
+                      ],
+                    ),
+                  ),
+                  const PopupMenuItem(
+                    value: 'edit',
+                    child: Row(
+                      children: [
+                        Icon(Icons.edit_outlined, size: 15),
+                        SizedBox(width: 8),
+                        Text('编辑配置', style: TextStyle(fontSize: 12.5)),
+                      ],
+                    ),
+                  ),
+                  const PopupMenuItem(
+                    value: 'delete',
+                    child: Row(
+                      children: [
+                        Icon(Icons.delete_outline_rounded,
+                            size: 15, color: Colors.redAccent),
+                        SizedBox(width: 8),
+                        Text('删除主机',
+                            style: TextStyle(
+                                fontSize: 12.5, color: Colors.redAccent)),
+                      ],
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
-          SizedBox(height: 10),
+          const SizedBox(height: 10),
           Row(
             children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  style: OutlinedButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    side: BorderSide(
-                      color: KwColors.accent.withValues(alpha: 0.45),
-                    ),
+              // 认证与代理标识
+              chip(
+                hasKey ? '🔑 $keyBadge' : '🔒 密码',
+                color: hasKey ? KwColors.ok : KwColors.dim,
+                background: hasKey ? KwColors.okSoft : KwColors.surface3,
+              ),
+              if (h.hasProxy) ...[
+                const SizedBox(width: 5),
+                chip(
+                  h.proxyKind.toUpperCase(),
+                  color: KwColors.accent,
+                  background: KwColors.accentSoft,
+                ),
+              ],
+              const Spacer(),
+              // 操作按钮组
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  minimumSize: const Size(0, 32),
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  side: BorderSide(
+                    color: KwColors.border,
                   ),
-                  onPressed: state.busy
-                      ? null
-                      : () {
-                          setState(() => _hostId = h.id);
-                          _connect(h);
-                        },
-                  icon: Icon(Icons.vpn_key_outlined, size: 15),
-                  label: Text('密钥管理', style: TextStyle(fontSize: 12)),
+                ),
+                onPressed: state.busy
+                    ? null
+                    : () {
+                        setState(() => _hostId = h.id);
+                        _connect(h);
+                      },
+                icon: Icon(Icons.vpn_key_outlined,
+                    size: 14, color: KwColors.dim),
+                label: Text(
+                  '密钥',
+                  style: TextStyle(fontSize: 12, color: KwColors.text),
                 ),
               ),
-              SizedBox(width: 8),
-              Expanded(
-                child: FilledButton.tonalIcon(
-                  style: FilledButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                  ),
-                  onPressed: state.busy
-                      ? null
-                      : () {
-                          setState(() => _hostId = h.id);
-                          _connect(h, openTerminal: true);
-                        },
-                  icon: Icon(Icons.terminal_rounded, size: 15),
-                  label: Text('打开终端', style: TextStyle(fontSize: 12)),
+              const SizedBox(width: 8),
+              FilledButton.icon(
+                style: FilledButton.styleFrom(
+                  visualDensity: VisualDensity.compact,
+                  minimumSize: const Size(0, 32),
+                  padding: const EdgeInsets.symmetric(horizontal: 12),
+                ),
+                onPressed: state.busy
+                    ? null
+                    : () {
+                        setState(() => _hostId = h.id);
+                        _connect(h, openTerminal: true);
+                      },
+                icon: const Icon(Icons.terminal_rounded, size: 14),
+                label: const Text(
+                  '>_ 终端',
+                  style:
+                      TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
                 ),
               ),
             ],
@@ -676,34 +946,38 @@ class _KeysTabState extends State<KeysTab> {
   /* 主机弹窗                                                            */
   /* ------------------------------------------------------------------ */
 
-  Future<void> _addHost() async {
-    final name = TextEditingController();
-    final host = TextEditingController();
-    final port = TextEditingController(text: '22');
-    final user = TextEditingController();
+  Future<void> _addHost() => _showHostDialog();
+
+  Future<void> _showHostDialog({HostConfig? initial}) async {
+    final isEdit = initial != null;
+    final name = TextEditingController(text: initial?.name ?? '');
+    final host = TextEditingController(text: initial?.host ?? '');
+    final port = TextEditingController(text: (initial?.port ?? 22).toString());
+    final user = TextEditingController(text: initial?.username ?? 'root');
+    final remotePath = TextEditingController(text: initial?.remotePath ?? '');
     final keys = bootstrap?.privateKeys ?? <LocalKeyEntry>[];
-    var identity = '';
+    var identity = initial?.identityFile ?? '';
     var submitted = false;
 
     await showDialog<void>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setLocal) => AlertDialog(
-          title: Text('添加主机'),
+          title: Text(isEdit ? '编辑服务器配置' : '添加服务器'),
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                field(name, '名称', hint: 'prod-vps'),
-                field(host, '地址', hint: '203.0.113.10'),
-                field(port, '端口', keyboard: TextInputType.number),
-                field(user, '用户名', hint: 'root'),
+                field(name, '备注名称', hint: '例如：prod-vps、FNOS-8100T'),
+                field(host, '主机地址 *', hint: 'IP 或域名，如 84.54.3.70'),
+                field(port, '端口 *', keyboard: TextInputType.number),
+                field(user, '登录用户 *', hint: 'root / ubuntu / admin'),
                 if (keys.isNotEmpty) ...[
                   DropdownButtonFormField<String>(
-                    initialValue: identity.isEmpty ? null : identity,
+                    initialValue: identity.isEmpty ? '' : identity,
                     decoration: InputDecoration(
-                      labelText: '登录私钥（可选）',
-                      helperText: '来自手机随身密钥包；不选就用密码登录',
+                      labelText: '登录认证方式',
+                      helperText: '来自手机随身密钥包；不选则用密码登录',
                       helperStyle: TextStyle(
                         fontSize: 11,
                         color: KwColors.faint,
@@ -711,14 +985,14 @@ class _KeysTabState extends State<KeysTab> {
                     ),
                     dropdownColor: KwColors.bgElev,
                     items: [
-                      DropdownMenuItem(value: '', child: Text('（用密码）')),
+                      const DropdownMenuItem(value: '', child: Text('🔒 密码登录')),
                       ...keys.map(
                         (k) => DropdownMenuItem(
                           value: k.path,
                           child: Text(
-                            k.name,
+                            '🔑 ${k.name}',
                             overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
+                            style: const TextStyle(
                               fontSize: 12,
                               fontFamily: 'monospace',
                             ),
@@ -728,18 +1002,27 @@ class _KeysTabState extends State<KeysTab> {
                     ],
                     onChanged: (v) => setLocal(() => identity = v ?? ''),
                   ),
+                  const SizedBox(height: 12),
                 ],
+                field(
+                  remotePath,
+                  '远端 authorized_keys 路径（可选）',
+                  hint: '留空默认 ~/.ssh/authorized_keys',
+                ),
               ],
             ),
           ),
           actions: [
-            TextButton(onPressed: () => Navigator.pop(ctx), child: Text('取消')),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('取消'),
+            ),
             FilledButton(
               onPressed: () {
                 submitted = true;
                 Navigator.pop(ctx);
               },
-              child: Text('保存'),
+              child: Text(isEdit ? '保存更改' : '添加'),
             ),
           ],
         ),
@@ -751,12 +1034,14 @@ class _KeysTabState extends State<KeysTab> {
       host: host.text.trim(),
       port: int.tryParse(port.text.trim()) ?? 22,
       user: user.text.trim(),
+      remotePath: remotePath.text.trim(),
       identity: identity,
     );
     name.dispose();
     host.dispose();
     port.dispose();
     user.dispose();
+    remotePath.dispose();
 
     if (!submitted || !mounted) return;
     if (data.host.isEmpty || data.user.isEmpty) {
@@ -765,13 +1050,20 @@ class _KeysTabState extends State<KeysTab> {
     }
     try {
       await state.saveHost(
+        id: initial?.id,
         name: data.name.isEmpty ? data.host : data.name,
         host: data.host,
         port: data.port,
         username: data.user,
         identityFile: data.identity,
+        remotePath: data.remotePath,
+        proxyKind: initial?.proxyKind ?? '',
+        proxyHost: initial?.proxyHost ?? '',
+        proxyPort: initial?.proxyPort ?? 1080,
       );
-      if (mounted) showSnack(context, '主机已保存', ok: true);
+      if (mounted) {
+        showSnack(context, isEdit ? '服务器配置已更新' : '服务器已添加', ok: true);
+      }
     } catch (e) {
       if (mounted) showError(context, e);
     }
@@ -785,20 +1077,20 @@ class _KeysTabState extends State<KeysTab> {
       builder: (ctx) => SafeArea(
         child: ListView(
           shrinkWrap: true,
-          padding: EdgeInsets.all(16),
+          padding: const EdgeInsets.all(16),
           children: [
             Text(
-              '主机',
+              '主机管理',
               style: TextStyle(
                 fontSize: 15,
                 fontWeight: FontWeight.w600,
                 color: KwColors.text,
               ),
             ),
-            SizedBox(height: 8),
+            const SizedBox(height: 8),
             if (hosts.isEmpty)
               Padding(
-                padding: EdgeInsets.symmetric(vertical: 12),
+                padding: const EdgeInsets.symmetric(vertical: 12),
                 child: Text(
                   '还没有主机',
                   style: TextStyle(fontSize: 13, color: KwColors.dim),
@@ -819,38 +1111,54 @@ class _KeysTabState extends State<KeysTab> {
                     color: KwColors.dim,
                   ),
                 ),
-                trailing: IconButton(
-                  icon: Icon(
-                    Icons.delete_outline_rounded,
-                    size: 18,
-                    color: KwColors.danger,
-                  ),
-                  onPressed: () async {
-                    final ok = await confirm(
-                      context,
-                      title: '删除主机',
-                      message: '只删本机配置，不会动服务器上的任何钥匙。',
-                      danger: true,
-                      confirmText: '删除',
-                    );
-                    if (!ok) return;
-                    try {
-                      await state.deleteHost(h.id);
-                    } catch (e) {
-                      if (mounted) showError(context, e);
-                    }
-                  },
+                trailing: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    IconButton(
+                      icon: Icon(
+                        Icons.edit_outlined,
+                        size: 18,
+                        color: KwColors.dim,
+                      ),
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        _showHostDialog(initial: h);
+                      },
+                    ),
+                    IconButton(
+                      icon: Icon(
+                        Icons.delete_outline_rounded,
+                        size: 18,
+                        color: KwColors.danger,
+                      ),
+                      onPressed: () async {
+                        final ok = await confirm(
+                          context,
+                          title: '删除主机',
+                          message: '只删本机配置，不会动服务器上的任何钥匙。',
+                          danger: true,
+                          confirmText: '删除',
+                        );
+                        if (!ok) return;
+                        try {
+                          await state.deleteHost(h.id);
+                        } catch (e) {
+                          if (mounted) showError(context, e);
+                        }
+                      },
+                    ),
+                  ],
                 ),
               ),
             ),
-            SizedBox(height: 8),
+            const SizedBox(height: 8),
             OutlinedButton.icon(
               onPressed: () {
                 Navigator.pop(ctx);
                 _addHost();
               },
-              icon: Icon(Icons.add_rounded, size: 16),
-              label: Text('添加主机'),
+              icon: const Icon(Icons.add_rounded, size: 16),
+              label: const Text('添加主机'),
             ),
           ],
         ),

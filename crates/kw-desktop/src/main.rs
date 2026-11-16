@@ -37,7 +37,7 @@ fn main() -> eframe::Result<()> {
     }
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_title("SSH Keywarden")
+        .with_title("Netwarden")
         .with_decorations(false)
         .with_inner_size([1240.0, 800.0])
         .with_min_inner_size([920.0, 600.0]);
@@ -63,7 +63,7 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "SSH Keywarden",
+        "Netwarden",
         options,
         Box::new(move |cc| Ok(Box::new(app::KwDesktopApp::new(cc, handle, data_dir)))),
     )

@@ -61,6 +61,9 @@ class AppState extends ChangeNotifier {
     required String username,
     String identityFile = '',
     String remotePath = '',
+    String proxyKind = '',
+    String proxyHost = '',
+    int proxyPort = 1080,
   }) => _run(() async {
     final data = await _engine.call('saveHost', {
       if (id != null && id.isNotEmpty) 'id': id,
@@ -70,6 +73,9 @@ class AppState extends ChangeNotifier {
       'username': username,
       'identityFile': identityFile,
       'remotePath': remotePath,
+      'proxyKind': proxyKind,
+      'proxyHost': proxyHost,
+      'proxyPort': proxyPort,
     });
     await _reloadQuiet();
     return HostConfig.fromJson(data);

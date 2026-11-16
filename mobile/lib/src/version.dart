@@ -10,4 +10,4 @@
 ///
 /// ⚠️ 月/日必须补零（`2026.11.03`）。写成 `2026.11.3` 会让 `version_test` 失败 ——
 /// 曾经就这么红过三天。
-const String kMobileVersion = 'v2026.11.03.2';
+const String kMobileVersion = 'v2026.11.16.1';

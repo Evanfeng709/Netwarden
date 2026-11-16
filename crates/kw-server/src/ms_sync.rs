@@ -515,6 +515,21 @@ async fn ensure_valid_token(
 /* 双向同步                                                            */
 /* ------------------------------------------------------------------ */
 
+/// 双向同步的阶段，给界面做进度条用。
+///
+/// 只有三段：拉取（网络）→ 合并（解密 + 写库，本地很快）→ 上传（网络）。
+/// 真正耗时的两段都在网络上，所以界面按「读云端 / 解密合并 / 上传」展示即可，
+/// 不必再往里切更细的粒度 —— 切了也是假进度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncPhase {
+    /// 正在从 OneDrive 读同步包
+    Fetching,
+    /// 正在解密包并把里面的主机 / 备注 / 私钥合并进本机库
+    Merging,
+    /// 正在把合并后的结果加密写回 OneDrive
+    Uploading,
+}
+
 /// 拉云端 → 合并进本地 → 把合并后的结果加密传回去。
 ///
 /// 已知主机指纹有冲突时**不上传**，把冲突交给用户确认：确认后带
@@ -526,6 +541,31 @@ pub async fn sync_now(
     trust_changed: &[String],
     force_upload: bool,
 ) -> Result<MsSyncResult, String> {
+    sync_now_with(
+        store,
+        known_hosts,
+        passphrase,
+        trust_changed,
+        force_upload,
+        |_| {},
+    )
+    .await
+}
+
+/// 同 [`sync_now`]，但每一步开始前回调一次阶段，供桌面端的进度条使用。
+///
+/// 回调在同步任务所在的线程上执行，只应往里丢一个 channel 消息，别做耗时操作。
+pub async fn sync_now_with<F>(
+    store: &Store,
+    known_hosts: &KnownHosts,
+    passphrase: &str,
+    trust_changed: &[String],
+    force_upload: bool,
+    on_phase: F,
+) -> Result<MsSyncResult, String>
+where
+    F: Fn(SyncPhase) + Send,
+{
     let data_dir = store.dir().to_path_buf();
     let cfg = read_config(&data_dir);
     let pass = passphrase.trim();
@@ -551,6 +591,7 @@ pub async fn sync_now(
     let pulled = if force_upload {
         false
     } else {
+        on_phase(SyncPhase::Fetching);
         let resp = client
             .get(&url)
             .bearer_auth(&auth.access_token)
@@ -566,6 +607,9 @@ pub async fn sync_now(
                 if text.trim().is_empty() {
                     false
                 } else {
+                    // 解密 + 写库都在 import_bundle 里，拆不开也没必要拆：
+                    // 这一段的耗时是毫秒级，UI 上只是让它从「读云端」跳到「上传」。
+                    on_phase(SyncPhase::Merging);
                     report = import_bundle(
                         store,
                         known_hosts,
@@ -598,6 +642,7 @@ pub async fn sync_now(
     }
 
     // 微软账号同步一定带口令（没有口令根本走不到这里），所以私钥随包一起走
+    on_phase(SyncPhase::Uploading);
     let bundle = export_bundle(store, known_hosts, &keys_dir, true, Some(pass))?;
     let put = client
         .put(&url)

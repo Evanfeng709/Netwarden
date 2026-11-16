@@ -39,7 +39,7 @@ fn run() -> Result<(), String> {
 
         let result = async {
             let login = login_file(&server)?;
-            println!("SSH Keywarden 浏览器模式已启动，仅监听本机。");
+            println!("Netwarden 浏览器模式已启动，仅监听本机。");
             println!("登录文件：{}", login.path().display());
             println!("该文件含本次登录凭据，请勿共享；正常退出时自动删除。");
             if !args.no_open && open::that(login.path()).is_err() {
@@ -64,7 +64,7 @@ fn login_file(server: &kw_server::RunningServer) -> Result<tempfile::NamedTempFi
         .tempfile()
         .map_err(|_| "无法创建临时登录文件")?;
     let html = zeroize::Zeroizing::new(format!(
-        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>SSH Keywarden 登录</title><p>此文件仅对本次运行有效，请勿共享。</p><a href=\"{}/login?token={}\" rel=\"noreferrer\">打开 SSH Keywarden</a></html>",
+        "<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>Netwarden 登录</title><p>此文件仅对本次运行有效，请勿共享。</p><a href=\"{}/login?token={}\" rel=\"noreferrer\">打开 Netwarden</a></html>",
         server.url(), server.token
     ));
     file.write_all(html.as_bytes())
@@ -141,7 +141,7 @@ fn parse_port(value: &str) -> Result<u16, String> {
 }
 
 fn print_help() {
-    println!("SSH Keywarden 浏览器模式\n\n用法：kw-server [选项]\n\n  -p, --port <端口>   优先于 PORT 环境变量，0 表示自动分配\n  --no-open          不自动打开浏览器（仍生成临时登录文件）\n  -h, --help         显示帮助\n\n环境变量：\n  KW_DATA_DIR        数据目录（默认 ./data）\n  KW_PUBLIC_DIR      静态资源目录（必须包含 index.html）\n\n仅监听环回地址；远程使用需自行建立 SSH 本地转发，并安全取用登录文件。\n令牌不会写入终端输出。强制终止后请自行删除遗留的登录文件。");
+    println!("Netwarden 浏览器模式\n\n用法：kw-server [选项]\n\n  -p, --port <端口>   优先于 PORT 环境变量，0 表示自动分配\n  --no-open          不自动打开浏览器（仍生成临时登录文件）\n  -h, --help         显示帮助\n\n环境变量：\n  KW_DATA_DIR        数据目录（默认 ./data）\n  KW_PUBLIC_DIR      静态资源目录（必须包含 index.html）\n\n仅监听环回地址；远程使用需自行建立 SSH 本地转发，并安全取用登录文件。\n令牌不会写入终端输出。强制终止后请自行删除遗留的登录文件。");
 }
 
 fn resolve_public_dir() -> Result<PathBuf, String> {

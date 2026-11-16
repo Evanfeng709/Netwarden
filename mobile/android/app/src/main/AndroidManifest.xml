@@ -2,7 +2,7 @@
     <!-- SSH 是裸 TCP，release 构建不会自动带 debug 那份 INTERNET 权限 -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <application
-        android:label="SSH Keywarden"
+        android:label="Netwarden"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity

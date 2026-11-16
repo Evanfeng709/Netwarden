@@ -1,4 +1,4 @@
-; SSH Keywarden 桌面端 NSIS 安装脚本（eframe 版，不依赖 Tauri bundler）
+; Netwarden 桌面端 NSIS 安装脚本（eframe 版，不依赖 Tauri bundler）
 ; 编译：makensis scripts\installer.nsi
 ; 支持：静默安装 /S；自定义目录 /D=<dir>（必须最后、不能带引号）
 
@@ -9,21 +9,21 @@ ManifestDPIAware true
 !include "FileFunc.nsh"
 !include "LogicLib.nsh"
 
-!define PRODUCT_NAME "SSH Keywarden"
-!define PRODUCT_VERSION "2026.11.9-1"
+!define PRODUCT_NAME "Netwarden"
+!define PRODUCT_VERSION "2026.11.15-1"
 !define PRODUCT_PUBLISHER "github"
-!define PRODUCT_EXE "kw-desktop.exe"
+!define PRODUCT_EXE "netwarden.exe"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 !define MANU_KEY "Software\${PRODUCT_PUBLISHER}\${PRODUCT_NAME}"
 
 Name "${PRODUCT_NAME}"
-OutFile "..\target\release\bundle\nsis\SSH Keywarden_${PRODUCT_VERSION}_x64-setup.exe"
-InstallDir "$LOCALAPPDATA\Programs\ssh-keywarden-tauri"
+OutFile "..\target\release\bundle\nsis\Netwarden_${PRODUCT_VERSION}_x64-setup.exe"
+InstallDir "$LOCALAPPDATA\Programs\Netwarden"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 SetCompressorDictSize 64
 
-VIProductVersion "2026.11.9.1"
+VIProductVersion "2026.11.15.1"
 VIAddVersionKey "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey "FileDescription" "${PRODUCT_NAME} Setup"
 VIAddVersionKey "FileVersion" "${PRODUCT_VERSION}"
@@ -42,6 +42,17 @@ VIAddVersionKey "CompanyName" "${PRODUCT_PUBLISHER}"
 !insertmacro MUI_LANGUAGE "English"
 
 Section "Install"
+  ; 覆盖安装前若旧进程仍在运行，先强制退出
+  nsExec::Exec 'taskkill /F /IM "${PRODUCT_EXE}"'
+  nsExec::Exec 'taskkill /F /IM "kw-desktop.exe"'
+  Sleep 500
+
+  ; 清理旧版 SSH Keywarden 快捷方式与注册表
+  Delete "$DESKTOP\SSH Keywarden.lnk"
+  Delete "$SMPROGRAMS\SSH Keywarden.lnk"
+  DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\SSH Keywarden"
+  DeleteRegKey HKCU "Software\github\SSH Keywarden"
+
   SetOutPath "$INSTDIR"
   File "..\target\release\${PRODUCT_EXE}"
   WriteUninstaller "$INSTDIR\uninstall.exe"

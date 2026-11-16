@@ -188,6 +188,54 @@ impl VtScreen {
         lines.join("\n")
     }
 
+    pub fn text_in_range(&self, p1: (usize, usize), p2: (usize, usize)) -> String {
+        let (start, end) = if p1 <= p2 { (p1, p2) } else { (p2, p1) };
+        let (r1, c1) = start;
+        let (r2, c2) = end;
+
+        let total_hist = self.history.len();
+        let total_lines = total_hist + self.grid().len();
+        if r1 >= total_lines {
+            return String::new();
+        }
+        let r2 = r2.min(total_lines.saturating_sub(1));
+
+        let mut lines = Vec::new();
+        for r in r1..=r2 {
+            let row_slice = if r < total_hist {
+                self.history.get(r).map(|v| v.as_slice())
+            } else {
+                self.grid().get(r - total_hist).map(|v| v.as_slice())
+            };
+            let Some(row) = row_slice else {
+                continue;
+            };
+            let start_col = if r == r1 { c1 } else { 0 };
+            let end_col = if r == r2 {
+                c2.min(row.len().saturating_sub(1))
+            } else {
+                row.len().saturating_sub(1)
+            };
+            if start_col > end_col || start_col >= row.len() {
+                lines.push(String::new());
+                continue;
+            }
+            let mut s = String::new();
+            for c in start_col..=end_col {
+                if let Some(cell) = row.get(c) {
+                    if !cell.continuation {
+                        s.push(cell.ch);
+                    }
+                }
+            }
+            lines.push(s.trim_end().to_string());
+        }
+        while lines.last().is_some_and(|l| l.is_empty()) {
+            lines.pop();
+        }
+        lines.join("\n")
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         let next_cols = cols.max(2);
         let next_rows = rows.max(2);
@@ -914,5 +962,15 @@ mod tests {
         assert_eq!(s.history().len(), 0);
         assert_eq!(s.cursor(), (12, 1));
         assert!(s.all_text().contains("root@vps:~#"));
+    }
+
+    #[test]
+    fn text_in_range_works() {
+        let mut s = VtScreen::new(20, 5);
+        s.feed(b"hello world\r\nline two");
+        let text = s.text_in_range((0, 0), (0, 4));
+        assert_eq!(text, "hello");
+        let multiline = s.text_in_range((0, 6), (1, 3));
+        assert_eq!(multiline, "world\nline");
     }
 }

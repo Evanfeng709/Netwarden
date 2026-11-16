@@ -380,18 +380,26 @@ fn resolve_data_dir(arg: Option<&Path>) -> PathBuf {
     if let Some(dir) = arg {
         return dir.to_path_buf();
     }
-    if let Some(dir) = env::var_os("KW_DATA_DIR") {
+    if let Some(dir) = env::var_os("NW_DATA_DIR").or_else(|| env::var_os("KW_DATA_DIR")) {
         return PathBuf::from(dir);
     }
     if let Some(base) = env::var_os("APPDATA") {
-        return PathBuf::from(base).join("ssh-keywarden").join("data");
+        let nw_dir = PathBuf::from(&base).join("netwarden").join("data");
+        if nw_dir.exists() {
+            return nw_dir;
+        }
+        let legacy = PathBuf::from(&base).join("ssh-keywarden").join("data");
+        if legacy.exists() {
+            return legacy;
+        }
+        return nw_dir;
     }
     PathBuf::from("data")
 }
 
 fn print_help() {
     println!(
-        "kw-sync — SSH Keywarden 微软账号同步（主机 / 备注 / 主机指纹，以及可选的主机在用私钥）
+        "kw-sync — Netwarden 微软账号同步（主机 / 备注 / 主机指纹，以及可选的主机在用私钥）
 
 用法：
   kw-sync login  [--client-id <GUID>] [--data-dir <目录>] [--json]

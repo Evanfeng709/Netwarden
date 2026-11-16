@@ -620,17 +620,19 @@ class _TerminalTabState extends State<TerminalTab> {
     final session = widget.state.session;
     if (session == null) return _placeholder();
     return Padding(
-      padding: EdgeInsets.fromLTRB(10, 10, 10, 6),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 6),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           _header(session),
           if (_showSnippets) ...[
-            SizedBox(height: 6),
+            const SizedBox(height: 6),
             _snippetBar(),
           ],
-          SizedBox(height: 6),
+          const SizedBox(height: 6),
           Expanded(child: _body()),
+          const SizedBox(height: 6),
+          _virtualKeyBar(),
         ],
       ),
     );
@@ -786,7 +788,7 @@ class _TerminalTabState extends State<TerminalTab> {
   Widget _body() {
     return Container(
       decoration: BoxDecoration(
-        color: KwColors.bg,
+        color: KwColors.surface2,
         borderRadius: BorderRadius.circular(8),
         border: Border.all(color: KwColors.border),
       ),
@@ -1041,6 +1043,93 @@ class _TerminalTabState extends State<TerminalTab> {
             ),
           );
         },
+      ),
+    );
+  }
+
+  Widget _keyBtn(
+    String label,
+    VoidCallback onTap, {
+    bool highlight = false,
+    bool isDanger = false,
+  }) {
+    return Container(
+      margin: const EdgeInsets.only(right: 6),
+      child: Material(
+        color: isDanger
+            ? KwColors.dangerSoft
+            : highlight
+                ? KwColors.accentSoft
+                : KwColors.surface2,
+        borderRadius: BorderRadius.circular(6),
+        child: InkWell(
+          onTap: () {
+            HapticFeedback.lightImpact();
+            onTap();
+          },
+          borderRadius: BorderRadius.circular(6),
+          child: Container(
+            constraints: const BoxConstraints(minWidth: 38),
+            height: 32,
+            padding: const EdgeInsets.symmetric(horizontal: 8),
+            alignment: Alignment.center,
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(6),
+              border: Border.all(
+                color: isDanger
+                    ? KwColors.danger.withValues(alpha: 0.4)
+                    : highlight
+                        ? KwColors.accent.withValues(alpha: 0.4)
+                        : KwColors.border,
+              ),
+            ),
+            child: Text(
+              label,
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight:
+                    (highlight || isDanger) ? FontWeight.w600 : FontWeight.w500,
+                fontFamily: 'monospace',
+                color: isDanger
+                    ? KwColors.danger
+                    : highlight
+                        ? KwColors.accent
+                        : KwColors.text,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 手机端终端虚拟辅助按键条（ESC、TAB、Ctrl-C、方向键等）。
+  Widget _virtualKeyBar() {
+    final app = _screen.applicationCursorKeys;
+    return SizedBox(
+      height: 34,
+      child: ListView(
+        scrollDirection: Axis.horizontal,
+        padding: const EdgeInsets.symmetric(vertical: 1),
+        children: [
+          _keyBtn('ESC', () => _sendBytes(const [0x1b])),
+          _keyBtn('TAB', () => _sendBytes(const [0x09]), highlight: true),
+          _keyBtn('Ctrl-C', () {
+            HapticFeedback.mediumImpact();
+            _sendBytes(const [0x03]);
+          }, isDanger: true),
+          _keyBtn('Ctrl-D', () => _sendBytes(const [0x04])),
+          _keyBtn('Ctrl-Z', () => _sendBytes(const [0x1a])),
+          _keyBtn('↑', () => _sendBytes(utf8.encode(app ? '\x1bOA' : '\x1b[A'))),
+          _keyBtn('↓', () => _sendBytes(utf8.encode(app ? '\x1bOB' : '\x1b[B'))),
+          _keyBtn('←', () => _sendBytes(utf8.encode(app ? '\x1bOD' : '\x1b[D'))),
+          _keyBtn('→', () => _sendBytes(utf8.encode(app ? '\x1bOC' : '\x1b[C'))),
+          _keyBtn('/', () => _sendText('/')),
+          _keyBtn('-', () => _sendText('-')),
+          _keyBtn('|', () => _sendText('|')),
+          _keyBtn('~', () => _sendText('~')),
+          _keyBtn(':', () => _sendText(':')),
+        ],
       ),
     );
   }

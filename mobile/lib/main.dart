@@ -65,7 +65,7 @@ class _KwAppState extends State<KwApp> {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'SSH Keywarden',
+      title: 'Netwarden',
       debugShowCheckedModeBanner: false,
       theme: KwTheme.build(),
       home: AnimatedBuilder(

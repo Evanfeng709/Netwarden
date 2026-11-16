@@ -497,6 +497,32 @@ impl MobileEngine {
         .map(|out| json!(out))
     }
 
+    /// 同 [`Self::ms_sync`]，但每进入一个阶段回调一次，供界面画进度条。
+    ///
+    /// 回调里的 `on_phase` 跑在同步任务的线程上，桌面端直接在里面往 UI
+    /// 的 channel 丢一条消息就行。
+    pub async fn ms_sync_with<F>(
+        &self,
+        passphrase: &str,
+        trust_changed: &[String],
+        force_upload: bool,
+        on_phase: F,
+    ) -> Result<Value, String>
+    where
+        F: Fn(ms_sync::SyncPhase) + Send,
+    {
+        ms_sync::sync_now_with(
+            &self.state.store,
+            &self.state.known_hosts,
+            passphrase,
+            trust_changed,
+            force_upload,
+            on_phase,
+        )
+        .await
+        .map(|out| json!(out))
+    }
+
     /* ------------------------------------------------------------------ */
     /* JSON 方法分发（C ABI 用）                                            */
     /* ------------------------------------------------------------------ */

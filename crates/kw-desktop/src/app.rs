@@ -16,6 +16,7 @@ use eframe::egui::{
 use serde_json::{json, Value};
 
 use kw_core::Secret;
+use kw_ffi::ms_sync;
 use kw_ffi::MobileEngine;
 use kw_keys::localkeys::LocalKeyEntry;
 use kw_server::connect::ConnectBody;
@@ -24,12 +25,27 @@ use kw_ssh::metrics::MonitorSnapshot;
 use kw_store::{Host as HostEntry, HostPatch, SettingsPatch};
 
 use crate::desktop::{
-    is_system_dark, read_theme, read_ui, save_bounds, save_theme, save_ui_mode, trim_working_set,
-    Bounds,
+    is_system_dark, read_theme, save_bounds, save_theme, save_ui_mode, trim_working_set, Bounds,
 };
 use crate::icons::{draw_icon, Icon};
 use crate::theme::{apply_palette, resolve_palette, Palette, PALETTES, THEME_CHOICES};
 use crate::vt::{is_wide_char, VtScreen};
+
+/// 毫秒时间戳 → `MM-DD HH:MM`（东八区）。同步结果卡里的「上次同步」用。
+fn fmt_epoch_ms(ms: u64) -> String {
+    let stamp = kw_ssh::util::shanghai_stamp(std::time::UNIX_EPOCH + Duration::from_millis(ms));
+    if stamp.len() >= 14 {
+        format!(
+            "{}-{} {}:{}",
+            &stamp[4..6],
+            &stamp[6..8],
+            &stamp[8..10],
+            &stamp[10..12]
+        )
+    } else {
+        "—".to_string()
+    }
+}
 
 /// SSH 登录密码的本机独立存储（host_id -> 密码）。
 /// 与 config.json / 云同步 / 导出完全隔离，沿用 proxy-auth.json 的同级安全口径：
@@ -296,6 +312,10 @@ enum BgEvent {
         report: Value,
         status: Value,
     },
+    /// 同步进入下一个阶段。界面靠它把「点了没反应」变成看得见的进度。
+    SyncProgress(ms_sync::SyncPhase),
+    /// 同步失败。跟 `Log` 分开是因为抽屉要留一张红卡 —— 只写日志等于没反馈。
+    SyncFailed(String),
     LocalScanDone(Vec<LocalKeyEntry>),
     TermOpened {
         term_id: String,
@@ -356,6 +376,7 @@ struct TabState {
 
     files_path: String,
     files_path_input: String,
+    files_manual_path: bool,
     files_entries: Vec<Value>,
     files_loaded: bool,
     files_error: Option<String>,
@@ -378,6 +399,16 @@ const SNIPPETS: [(&str, &str); 5] = [
     ("系统负载", "uptime && top -bn1 | head -n 15\r"),
 ];
 
+/// 一次同步的结果，画成云同步抽屉里的一张卡。
+///
+/// 之所以要这张卡：原来同步完只往日志抽屉里塞一行字，而日志抽屉默认是关着的，
+/// 用户看到的就是「点了一下，什么都没发生」。
+struct SyncOutcome {
+    ok: bool,
+    title: String,
+    lines: Vec<String>,
+}
+
 pub struct KwDesktopApp {
     rt: tokio::runtime::Handle,
     engine: Arc<MobileEngine>,
@@ -393,6 +424,15 @@ pub struct KwDesktopApp {
     was_minimized: bool,
     startup_frames: u8,
     busy: bool,
+
+    /// 同步正在进行的阶段；`Some` 表示抽屉里该显示进度条，同时驱动逐帧重绘。
+    sync_phase: Option<ms_sync::SyncPhase>,
+    /// 本次同步的起始时刻，用来算「用时 2.4s」。
+    sync_started: Option<Instant>,
+    /// 上一次同步的结果卡。存在 App 上而非 Drawer 里：抽屉关掉再打开仍要能看到。
+    sync_outcome: Option<SyncOutcome>,
+    /// 点击同步那一刻本机的主机数，用来算「7 → 8 台」。
+    sync_hosts_before: usize,
 
     hosts: Vec<HostEntry>,
     key_notes: HashMap<String, String>,
@@ -410,6 +450,8 @@ pub struct KwDesktopApp {
     term_scroll_offset: usize,
     term_focused: bool,
     last_sent_size: (usize, usize),
+    term_selection: Option<((usize, usize), (usize, usize))>,
+    term_drag_start: Option<(usize, usize)>,
 
     /// 多会话标签。空 = 没有任何终端会话；`active` 指向「状态摊在 self 上」的那个。
     tabs: Vec<TabState>,
@@ -417,6 +459,7 @@ pub struct KwDesktopApp {
 
     files_path: String,
     files_path_input: String,
+    files_manual_path: bool,
     files_entries: Vec<Value>,
     files_loaded: bool,
     files_loading: bool,
@@ -431,6 +474,7 @@ pub struct KwDesktopApp {
     mon_interval_ms: u64,
     mon_paused: bool,
     mon_polling: bool,
+    mon_sort_by_mem: bool,
     mon_last_poll: Instant,
     mon_snap: Option<MonitorSnapshot>,
     mon_error: Option<String>,
@@ -479,13 +523,11 @@ impl KwDesktopApp {
         let palette = resolve_palette(&theme_choice, sys_dark);
         apply_palette(&cc.egui_ctx, &palette);
 
-        let ui_val = read_ui(&data_dir);
-        let mode = match ui_val.get("mode").and_then(|v| v.as_str()) {
-            Some("term") => ViewMode::Term,
-            Some("files") => ViewMode::Files,
-            Some("monitor") => ViewMode::Monitor,
-            _ => ViewMode::Keys,
-        };
+        // 开屏固定落在「主机与密钥」：终端 / 文件 / 监控三页都依附当前 SSH 会话，
+        // 冷启动必然没有会话，恢复上次停留的页面只会让人一开软件就看到一块空面板，
+        // 还容易被误判成「连不上」。ui.json 里的 mode 仍由 switch_mode 继续写，
+        // 只是不再回读（见 desktop::read_ui 的说明）。
+        let mode = ViewMode::Keys;
 
         let (tx, rx) = mpsc::channel();
         let hosts = engine.state().store.list_hosts();
@@ -512,6 +554,10 @@ impl KwDesktopApp {
             was_minimized: false,
             startup_frames: 0,
             busy: false,
+            sync_phase: None,
+            sync_started: None,
+            sync_outcome: None,
+            sync_hosts_before: 0,
             hosts,
             key_notes,
             local_keys: Vec::new(),
@@ -526,10 +572,13 @@ impl KwDesktopApp {
             term_scroll_offset: 0,
             term_focused: false,
             last_sent_size: (100, 30),
+            term_selection: None,
+            term_drag_start: None,
             tabs: Vec::new(),
             active: 0,
             files_path: String::new(),
             files_path_input: String::new(),
+            files_manual_path: false,
             files_entries: Vec::new(),
             files_loaded: false,
             files_loading: false,
@@ -543,6 +592,7 @@ impl KwDesktopApp {
             mon_interval_ms: 2000,
             mon_paused: false,
             mon_polling: false,
+            mon_sort_by_mem: false,
             mon_last_poll: Instant::now(),
             mon_snap: None,
             mon_error: None,
@@ -584,6 +634,106 @@ impl KwDesktopApp {
         });
         if self.logs.len() > 200 {
             self.logs.remove(0);
+        }
+    }
+
+    /// 把一次同步的返回折成抽屉里那张卡。
+    ///
+    /// 「双向同步」到底合成了什么，是这个功能最该说清楚的事：只说「同步完成」
+    /// 等于没说，所以这里把主机增减、备注 / 私钥条数、是否真的上传、上次同步时间
+    /// 全部摊开。数字全为零时也要明说「两处已经一致」，免得用户以为没生效。
+    fn build_sync_outcome(
+        result: &Value,
+        hosts_before: usize,
+        hosts_after: usize,
+        elapsed: Duration,
+    ) -> SyncOutcome {
+        let inner = result.get("report");
+        let count = |key: &str| {
+            inner
+                .and_then(|r| r.get(key))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+        };
+        let pulled = result
+            .get("pulled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let pushed = result
+            .get("pushed")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let last_sync_at = result
+            .get("lastSyncAt")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let conflicts: Vec<&Value> = inner
+            .and_then(|r| r.get("knownHostConflicts"))
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().collect())
+            .unwrap_or_default();
+        if !conflicts.is_empty() {
+            let mut lines = vec![
+                if pulled {
+                    "云端包已拉取并合并进本机".to_string()
+                } else {
+                    "没有读到云端包".to_string()
+                },
+                "本机数据未上传：指纹变化要你先确认，否则等于用旧信任覆盖云端".to_string(),
+            ];
+            for c in conflicts.iter().take(3) {
+                let host = c
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(未知主机)");
+                let port = c.get("port").and_then(|v| v.as_u64()).unwrap_or(22);
+                lines.push(format!("· {host}:{port} 指纹与云端不一致"));
+            }
+            if conflicts.len() > 3 {
+                lines.push(format!("· 另有 {} 项", conflicts.len() - 3));
+            }
+            return SyncOutcome {
+                ok: false,
+                title: format!("同步中断 · {} 项主机指纹待确认", conflicts.len()),
+                lines,
+            };
+        }
+
+        let mut lines = Vec::new();
+        lines.push(if pulled {
+            "云端包：已拉取并合并".to_string()
+        } else {
+            "云端还没有同步包，本次为首次上传".to_string()
+        });
+        let hosts_now = hosts_after;
+        lines.push(if hosts_now == hosts_before {
+            format!("本机主机：{hosts_now} 台，无增减")
+        } else {
+            format!("本机主机：{hosts_before} 台 → {hosts_now} 台")
+        });
+
+        let added = count("addedHosts");
+        let updated = count("updatedHosts");
+        let deleted = count("deletedHosts");
+        let notes = count("syncedNotes");
+        let keys = count("importedKeys");
+        lines.push(if added + updated + deleted + notes + keys == 0 {
+            "没有需要写入的变化，两边本来就一致".to_string()
+        } else {
+            format!("新增 {added} · 更新 {updated} · 删除 {deleted} · 备注 {notes} · 私钥 {keys}")
+        });
+        if !pushed {
+            lines.push("未上传：云端这次保持原样".to_string());
+        }
+        if last_sync_at > 0 {
+            lines.push(format!("上次同步：{}", fmt_epoch_ms(last_sync_at)));
+        }
+
+        SyncOutcome {
+            ok: true,
+            title: format!("同步完成 · 用时 {:.1}s", elapsed.as_secs_f32()),
+            lines,
         }
     }
 
@@ -630,6 +780,7 @@ impl KwDesktopApp {
         t.last_sent_size = self.last_sent_size;
         t.files_path = self.files_path.clone();
         t.files_path_input = self.files_path_input.clone();
+        t.files_manual_path = self.files_manual_path;
         t.files_entries = self.files_entries.clone();
         t.files_loaded = self.files_loaded;
         t.files_error = self.files_error.clone();
@@ -644,6 +795,11 @@ impl KwDesktopApp {
         if idx >= self.tabs.len() {
             return;
         }
+        if idx != self.active {
+            self.stash_active();
+        }
+        self.term_selection = None;
+        self.term_drag_start = None;
         let t = self.tabs[idx].clone();
         self.active = idx;
         self.session = t.session;
@@ -653,6 +809,7 @@ impl KwDesktopApp {
         self.last_sent_size = t.last_sent_size;
         self.files_path = t.files_path;
         self.files_path_input = t.files_path_input;
+        self.files_manual_path = t.files_manual_path;
         self.files_entries = t.files_entries;
         self.files_loaded = t.files_loaded;
         self.files_error = t.files_error;
@@ -677,6 +834,7 @@ impl KwDesktopApp {
             last_sent_size: (100, 30),
             files_path: String::new(),
             files_path_input: String::new(),
+            files_manual_path: false,
             files_entries: Vec::new(),
             files_loaded: false,
             files_error: None,
@@ -691,8 +849,11 @@ impl KwDesktopApp {
         self.vt = VtScreen::new(100, 30);
         self.term_scroll_offset = 0;
         self.last_sent_size = (100, 30);
+        self.term_selection = None;
+        self.term_drag_start = None;
         self.files_path.clear();
         self.files_path_input.clear();
+        self.files_manual_path = false;
         self.files_entries.clear();
         self.files_loaded = false;
         self.files_error = None;
@@ -837,7 +998,8 @@ impl KwDesktopApp {
         });
     }
 
-    fn poll_monitor(&mut self, force: bool) {        if self.mon_polling || self.mon_paused {
+    fn poll_monitor(&mut self, force: bool) {
+        if self.mon_polling || self.mon_paused {
             return;
         }
         let Some(sid) = self.current_sid() else {
@@ -1229,6 +1391,21 @@ impl KwDesktopApp {
         });
     }
 
+    fn send_term_paste(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.vt.bracketed_paste {
+            let mut bytes = Vec::with_capacity(text.len() + 16);
+            bytes.extend_from_slice(b"\x1b[200~");
+            bytes.extend_from_slice(text.as_bytes());
+            bytes.extend_from_slice(b"\x1b[201~");
+            self.send_term_bytes(&bytes);
+        } else {
+            self.send_term_bytes(text.as_bytes());
+        }
+    }
+
     /* ------------------------------------------------------------------ */
     /* SFTP 文件浏览与传输                                                  */
     /* ------------------------------------------------------------------ */
@@ -1385,7 +1562,11 @@ impl KwDesktopApp {
             self.push_log("请先刷新并进入一个远端目录", LogKind::Warn);
             return;
         }
-        let Some(path) = rfd::FileDialog::new().pick_file() else {
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(dir) = &self.files_local_dir {
+            dialog = dialog.set_directory(dir);
+        }
+        let Some(path) = dialog.pick_file() else {
             return;
         };
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
@@ -1793,6 +1974,10 @@ impl KwDesktopApp {
                 }
                 BgEvent::SyncStatus(st) => {
                     self.busy = false;
+                    self.sync_phase = None;
+                    self.sync_started = None;
+                    // 登录态变了，上一次同步的结果卡不再代表当前账号。
+                    self.sync_outcome = None;
                     self.ms_status = st;
                 }
                 BgEvent::SyncDeviceCode {
@@ -1810,10 +1995,19 @@ impl KwDesktopApp {
                 }
                 BgEvent::SyncDone { report, status } => {
                     self.busy = false;
+                    let elapsed = self
+                        .sync_started
+                        .take()
+                        .map(|t| t.elapsed())
+                        .unwrap_or_default();
+                    self.sync_phase = None;
                     self.ms_status = status;
                     self.reload_store_data();
+
+                    // 冲突清单落在抽屉里，供用户逐条确认；结果卡同时保留摘要。
                     let conflicts = report
-                        .get("conflicts")
+                        .get("report")
+                        .and_then(|r| r.get("knownHostConflicts"))
                         .and_then(|v| v.as_array())
                         .cloned()
                         .unwrap_or_default();
@@ -1824,13 +2018,41 @@ impl KwDesktopApp {
                         {
                             *c_slot = conflicts;
                         }
+                    }
+
+                    let outcome = Self::build_sync_outcome(
+                        &report,
+                        self.sync_hosts_before,
+                        self.hosts.len(),
+                        elapsed,
+                    );
+                    if outcome.ok {
                         self.push_log(
-                            "同步发现主机指纹冲突，请在抽屉中选择处理方式",
-                            LogKind::Warn,
+                            format!("{}（{}）", outcome.title, outcome.lines.join("；")),
+                            LogKind::Ok,
                         );
                     } else {
-                        self.push_log("微软 OneDrive 密钥库元数据同步完成", LogKind::Ok);
+                        self.push_log(outcome.title.clone(), LogKind::Warn);
                     }
+                    self.sync_outcome = Some(outcome);
+                }
+                BgEvent::SyncProgress(phase) => {
+                    // 首次回调前界面已经先自己置成 Fetching 了，这里只做推进。
+                    self.sync_phase = Some(phase);
+                    if self.sync_started.is_none() {
+                        self.sync_started = Some(Instant::now());
+                    }
+                }
+                BgEvent::SyncFailed(msg) => {
+                    self.busy = false;
+                    self.sync_phase = None;
+                    self.sync_started = None;
+                    self.push_log(format!("云同步失败：{msg}"), LogKind::Err);
+                    self.sync_outcome = Some(SyncOutcome {
+                        ok: false,
+                        title: "同步失败".to_string(),
+                        lines: vec![msg],
+                    });
                 }
                 BgEvent::LocalScanDone(entries) => {
                     self.local_keys = entries;
@@ -1850,22 +2072,37 @@ impl KwDesktopApp {
                     self.push_log(format!("SSH 终端已就绪 ({cols}×{rows})"), LogKind::Ok);
                 }
                 BgEvent::TermOutput { term_id, bytes } => {
-                    // 只渲染当前会话的输出；非活动会话的输出在切换逻辑里落到各自的屏幕
                     if self.term_id.as_deref() == Some(term_id.as_str()) {
                         self.vt.feed(&bytes);
                         self.term_scroll_offset = 0;
                         ctx.request_repaint();
+                    } else if let Some(t) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.term_id.as_deref() == Some(term_id.as_str()))
+                    {
+                        t.vt.feed(&bytes);
                     }
                 }
                 BgEvent::TermClosed { term_id, error } => {
-                    // 空 term_id = 还没开起来就失败了，也归当前会话处理
-                    if term_id.is_empty() || self.term_id.as_deref() == Some(term_id.as_str()) {
+                    let is_active = term_id.is_empty()
+                        || self.term_id.as_deref() == Some(term_id.as_str());
+                    if is_active {
                         self.term_id = None;
+                        if let Some(t) = self.tabs.get_mut(self.active) {
+                            t.term_id = None;
+                        }
                         if let Some(msg) = error {
                             self.push_log(format!("终端已关闭：{msg}"), LogKind::Warn);
                         } else {
                             self.push_log("SSH 终端会话已结束", LogKind::Info);
                         }
+                    } else if let Some(t) = self
+                        .tabs
+                        .iter_mut()
+                        .find(|t| t.term_id.as_deref() == Some(term_id.as_str()))
+                    {
+                        t.term_id = None;
                     }
                 }
                 BgEvent::FilesListed { path, entries } => {
@@ -1913,34 +2150,59 @@ impl KwDesktopApp {
                 }
                 BgEvent::MonitorSnapshot { sid, snap } => {
                     self.mon_polling = false;
-                    if self.current_sid().as_deref() != Some(sid.as_str()) {
-                        continue;
-                    }
+                    let is_current = self.current_sid().as_deref() == Some(sid.as_str());
                     match serde_json::from_value::<MonitorSnapshot>(snap) {
                         Ok(m) => {
-                            self.push_monitor_history(&m);
-                            self.mon_snap = Some(m);
-                            self.mon_error = None;
-                            self.mon_stale = false;
+                            if is_current {
+                                self.push_monitor_history(&m);
+                                self.mon_snap = Some(m);
+                                self.mon_error = None;
+                                self.mon_stale = false;
+                            } else if let Some(t) = self.tabs.iter_mut().find(|t| {
+                                t.session
+                                    .as_ref()
+                                    .and_then(|s| s.get("id"))
+                                    .and_then(|v| v.as_str())
+                                    == Some(sid.as_str())
+                            }) {
+                                t.mon_snap = Some(m);
+                                t.mon_error = None;
+                            }
                         }
                         Err(e) => {
-                            self.mon_error = Some(format!("监控数据解析失败：{e}"));
+                            if is_current {
+                                self.mon_error = Some(format!("监控数据解析失败：{e}"));
+                            }
                         }
                     }
                 }
                 BgEvent::MonitorFailed { sid, message } => {
                     self.mon_polling = false;
-                    if self.current_sid().as_deref() != Some(sid.as_str()) {
-                        continue;
+                    if self.current_sid().as_deref() == Some(sid.as_str()) {
+                        self.mon_error = Some(message);
+                    } else if let Some(t) = self.tabs.iter_mut().find(|t| {
+                        t.session
+                            .as_ref()
+                            .and_then(|s| s.get("id"))
+                            .and_then(|v| v.as_str())
+                            == Some(sid.as_str())
+                    }) {
+                        t.mon_error = Some(message);
                     }
-                    self.mon_error = Some(message);
                 }
                 BgEvent::LatencyMeasured { sid, ms } => {
-                    if self.current_sid().as_deref() != Some(sid.as_str()) {
-                        continue;
-                    }
-                    self.lat_ms = Some(ms);
-                    if let Some(t) = self.tabs.get_mut(self.active) {
+                    if self.current_sid().as_deref() == Some(sid.as_str()) {
+                        self.lat_ms = Some(ms);
+                        if let Some(t) = self.tabs.get_mut(self.active) {
+                            t.lat_ms = Some(ms);
+                        }
+                    } else if let Some(t) = self.tabs.iter_mut().find(|t| {
+                        t.session
+                            .as_ref()
+                            .and_then(|s| s.get("id"))
+                            .and_then(|v| v.as_str())
+                            == Some(sid.as_str())
+                    }) {
                         t.lat_ms = Some(ms);
                     }
                 }
@@ -1986,6 +2248,7 @@ impl eframe::App for KwDesktopApp {
 
         // 定期请求重绘以便后台任务与终端输出实时刷新
         let live = self.busy
+            || self.sync_phase.is_some()
             || self.term_id.is_some()
             || self.files_loading
             || self.transfers_running()
@@ -2031,6 +2294,45 @@ impl eframe::App for KwDesktopApp {
                     );
                 }
             });
+        }
+
+        // 全局键盘快捷键（未打开抽屉且非编辑文本框时生效）
+        let has_active_edit = ctx.memory(|m| m.focused().is_some() && !self.term_focused);
+        if !has_active_edit && matches!(self.drawer, Drawer::None) {
+            // 模式切换：Alt + 1..4
+            if ctx.input(|i| i.modifiers.alt && !i.modifiers.ctrl) {
+                if ctx.input(|i| i.key_pressed(egui::Key::Num1)) {
+                    self.switch_mode(ViewMode::Keys);
+                } else if ctx.input(|i| i.key_pressed(egui::Key::Num2)) {
+                    self.switch_mode(ViewMode::Term);
+                } else if ctx.input(|i| i.key_pressed(egui::Key::Num3)) {
+                    self.switch_mode(ViewMode::Files);
+                } else if ctx.input(|i| i.key_pressed(egui::Key::Num4)) {
+                    self.switch_mode(ViewMode::Monitor);
+                }
+            }
+            // 标签轮换：Ctrl + Tab / Ctrl + Shift + Tab
+            if self.tabs.len() > 1 {
+                let next_tab = ctx.input(|i| {
+                    i.modifiers.ctrl && !i.modifiers.shift && i.key_pressed(egui::Key::Tab)
+                });
+                let prev_tab = ctx.input(|i| {
+                    i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::Tab)
+                });
+                if next_tab {
+                    let next_idx = (self.active + 1) % self.tabs.len();
+                    self.activate_tab(next_idx);
+                    self.switch_mode(ViewMode::Term);
+                } else if prev_tab {
+                    let prev_idx = if self.active == 0 {
+                        self.tabs.len() - 1
+                    } else {
+                        self.active - 1
+                    };
+                    self.activate_tab(prev_idx);
+                    self.switch_mode(ViewMode::Term);
+                }
+            }
         }
 
         self.render_topbar(ctx, maximized);
@@ -2248,10 +2550,15 @@ impl KwDesktopApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 7.0;
+
+                    // 在线状态指示点 + 主机端点
+                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(6.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 3.0, p.ok);
                     ui.label(
                         RichText::new(&endpoint)
                             .size(11.0)
                             .monospace()
+                            .strong()
                             .color(p.text),
                     );
                     if ui
@@ -2268,9 +2575,12 @@ impl KwDesktopApp {
                     ui.label(RichText::new("│").size(11.0).color(p.border));
 
                     if metrics.is_empty() {
-                        ui.label(RichText::new("指标加载中…").size(10.5).color(p.faint));
+                        ui.label(RichText::new("指标采集中…").size(10.5).color(p.faint));
                     } else {
-                        for m in &metrics {
+                        for (i, m) in metrics.iter().enumerate() {
+                            if i > 0 {
+                                ui.label(RichText::new("·").size(10.5).color(p.border));
+                            }
                             ui.label(RichText::new(m).size(10.5).color(p.dim));
                         }
                     }
@@ -2286,14 +2596,7 @@ impl KwDesktopApp {
                         if Self::tiny_btn(ui, "清屏", p.dim) {
                             act = Some(3);
                         }
-                        if Self::tiny_btn(ui, "粘贴", p.dim) {
-                            act = Some(4);
-                        }
-                        if Self::tiny_btn(ui, "复制全屏", p.dim) {
-                            act = Some(5);
-                        }
-                        // 原来占半行的 5 个快捷指令按钮，收进这个菜单
-                        ui.menu_button(RichText::new("⚡").size(11.0).color(p.dim), |ui| {
+                        ui.menu_button(RichText::new("⚡ 快捷指令").size(10.5).color(p.dim), |ui| {
                             for (lbl, cmd) in SNIPPETS {
                                 if ui.button(lbl).clicked() {
                                     snippet = Some(cmd);
@@ -2403,7 +2706,7 @@ impl KwDesktopApp {
 
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("SSH Keywarden")
+                        RichText::new("Netwarden")
                             .size(13.5)
                             .strong()
                             .color(p.text),
@@ -2491,20 +2794,13 @@ impl KwDesktopApp {
                             self.open_settings_drawer();
                         }
 
-                        // 一键切换主题配色按钮
+                        // 一键切换主题配色按钮（仅保留曜石、亚麻）
                         let theme_short = match self.palette.id {
-                            "obsidian" => "曜石",
-                            "midnight" => "午夜",
-                            "graphite" => "石墨",
-                            "cloud" => "云白",
                             "linen" => "亚麻",
-                            "mist" => "雾青",
-                            _ => "主题",
+                            _ => "曜石",
                         };
                         if Self::top_icon_btn(ui, &p, Some(Icon::Theme), theme_short, false, false)
-                            .on_hover_text(
-                                "点击切换主题配色（曜石 / 午夜 / 石墨 / 云白 / 亚麻 / 雾青）",
-                            )
+                            .on_hover_text("点击切换主题配色（曜石 / 亚麻）")
                             .clicked()
                         {
                             let idx = PALETTES
@@ -3435,27 +3731,94 @@ impl KwDesktopApp {
             {
                 self.load_files(parent);
             }
-            let (s_rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
-            draw_icon(ui.painter(), s_rect.center(), 13.0, Icon::Folder, p.dim);
-            ui.add(
-                egui::TextEdit::singleline(&mut self.files_path_input)
-                    .hint_text("/home/user")
-                    .font(FontId::monospace(12.0))
-                    .desired_width(380.0),
-            );
-            if Self::action_btn(ui, &p, "跳转", false, false).clicked() {
-                let target = self.files_path_input.trim().to_string();
-                if !target.is_empty() {
+
+            if self.files_manual_path {
+                let (s_rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
+                draw_icon(ui.painter(), s_rect.center(), 13.0, Icon::Folder, p.dim);
+                let path_edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.files_path_input)
+                        .hint_text("/home/user")
+                        .font(FontId::monospace(12.0))
+                        .desired_width(320.0),
+                );
+                let jump_clicked = Self::action_btn(ui, &p, "跳转", false, false).clicked();
+                let enter_pressed = path_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if jump_clicked || enter_pressed {
+                    let target = self.files_path_input.trim().to_string();
+                    if !target.is_empty() {
+                        self.load_files(target);
+                        self.files_manual_path = false;
+                    }
+                }
+                if Self::mini_btn(ui, &p, "✕", false).clicked() {
+                    self.files_manual_path = false;
+                }
+            } else {
+                // 面包屑分段式导航（Netcatty 风格）
+                let mut navigate_to: Option<String> = None;
+                Frame::NONE
+                    .fill(p.surface2)
+                    .stroke(Stroke::new(1.0_f32, p.border))
+                    .corner_radius(CornerRadius::same(7))
+                    .inner_margin(Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let (s_rect, _) = ui.allocate_exact_size(Vec2::new(16.0, 16.0), Sense::hover());
+                        draw_icon(ui.painter(), s_rect.center(), 12.0, Icon::Folder, p.accent);
+
+                        if ui.add(egui::Label::new(RichText::new("/").size(12.0).strong().monospace().color(p.text)).sense(Sense::click()))
+                            .on_hover_text("根目录 /")
+                            .clicked()
+                        {
+                            navigate_to = Some("/".to_string());
+                        }
+
+                        let parts: Vec<&str> = self.files_path.split('/').filter(|s| !s.is_empty()).collect();
+                        let mut accum = String::new();
+                        for (idx, part) in parts.iter().enumerate() {
+                            accum.push('/');
+                            accum.push_str(part);
+                            let target_path = accum.clone();
+                            ui.label(RichText::new("›").size(11.0).color(p.faint));
+                            let is_last = idx == parts.len() - 1;
+                            let text_color = if is_last { p.accent } else { p.text };
+                            let resp = ui.add(
+                                egui::Label::new(
+                                    RichText::new(*part)
+                                        .size(12.0)
+                                        .strong()
+                                        .monospace()
+                                        .color(text_color)
+                                )
+                                .sense(Sense::click())
+                            )
+                            .on_hover_text(format!("进入 {target_path}"));
+                            if resp.clicked() && !is_last {
+                                navigate_to = Some(target_path);
+                            }
+                        }
+
+                        if ui.add(egui::Label::new(RichText::new(" ✏ ").size(10.0).color(p.faint)).sense(Sense::click()))
+                            .on_hover_text("点击切换为手动输入路径")
+                            .clicked()
+                        {
+                            self.files_manual_path = true;
+                            self.files_path_input = self.files_path.clone();
+                        }
+                    });
+
+                if let Some(target) = navigate_to {
                     self.load_files(target);
                 }
             }
+
             ui.separator();
             let (s_rect, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
             draw_icon(ui.painter(), s_rect.center(), 13.0, Icon::Search, p.dim);
             ui.add(
                 egui::TextEdit::singleline(&mut self.files_search)
                     .hint_text("筛选当前目录…")
-                    .desired_width(200.0),
+                    .desired_width(180.0),
             );
             if self.files_loading {
                 ui.spinner();
@@ -3554,95 +3917,167 @@ impl KwDesktopApp {
             .unwrap_or_else(|| "—".to_string());
         let selected = self.files_selected.as_deref() == Some(path.as_str());
 
-        let border = if selected { p.accent } else { p.border };
-        Frame::NONE
-            .fill(if selected { p.accent_soft } else { p.panel })
-            .stroke(Stroke::new(1.0_f32, border))
-            .corner_radius(CornerRadius::same(8))
-            .inner_margin(Margin::symmetric(10, 5))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let icon = if is_dir {
-                        Icon::Folder
-                    } else if kind == "symlink" {
-                        Icon::Link
-                    } else {
-                        Icon::File
-                    };
-                    let (ico, _) = ui.allocate_exact_size(Vec2::new(18.0, 18.0), Sense::hover());
-                    draw_icon(
-                        ui.painter(),
-                        ico.center(),
-                        13.0,
-                        icon,
-                        if is_dir { p.warn } else { p.dim },
-                    );
+        let mut do_download: Option<(String, String)> = None;
+        let mut do_load_dir: Option<String> = None;
+        let mut do_rename: Option<(String, String)> = None;
+        let mut do_chmod: Option<(String, String)> = None;
+        let mut do_copy_path: Option<String> = None;
+        let mut do_delete: Option<(String, bool)> = None;
 
-                    let name_w = (ui.available_width() - 340.0).max(130.0);
-                    let label = ui
-                        .allocate_ui_with_layout(
-                            Vec2::new(name_w, 20.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&name).size(12.5).strong().color(p.text),
-                                    )
-                                    .sense(Sense::click())
-                                    .truncate(),
-                                )
-                            },
-                        )
-                        .inner;
-                    if label.clicked() {
-                        self.files_selected = Some(path.clone());
-                    }
-                    if label.double_clicked() {
-                        if is_dir {
-                            self.load_files(path.clone());
-                        } else {
-                            self.pick_and_download(path.clone(), name.clone());
-                        }
-                    }
+        let row_h = 30.0;
+        let (row_rect, row_resp) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), row_h),
+            Sense::click(),
+        );
 
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if Self::mini_btn(ui, &p, "删除", true).clicked() {
-                            self.open_file_remove(path.clone(), is_dir);
-                        }
-                        if Self::mini_btn(ui, &p, "权限", false).clicked() {
-                            self.drawer = Drawer::FileChmod {
-                                path: path.clone(),
-                                mode: mode_text.clone(),
-                            };
-                        }
-                        if Self::mini_btn(ui, &p, "改名", false).clicked() {
-                            self.drawer = Drawer::FileRename {
-                                from: path.clone(),
-                                name: name.clone(),
-                            };
-                        }
-                        if is_dir {
-                            if Self::mini_btn(ui, &p, "打开", false).clicked() {
-                                self.load_files(path.clone());
-                            }
-                        } else if Self::mini_btn(ui, &p, "下载", false).clicked() {
-                            self.pick_and_download(path.clone(), name.clone());
-                        }
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(perms).size(10.5).monospace().color(p.faint));
-                        ui.add_space(6.0);
-                        ui.label(RichText::new(&mtime).size(10.5).monospace().color(p.faint));
-                        ui.add_space(6.0);
-                        let size_text = if is_dir {
-                            "—".to_string()
-                        } else {
-                            human_size(size)
-                        };
-                        ui.label(RichText::new(size_text).size(10.5).monospace().color(p.dim));
-                    });
-                });
-            });
-        ui.add_space(4.0);
+        let hovered = row_resp.hovered();
+        let fill_bg = if selected {
+            p.accent_soft
+        } else if hovered {
+            p.surface3
+        } else {
+            p.panel
+        };
+        let border_col = if selected {
+            p.accent
+        } else if hovered {
+            p.border
+        } else {
+            p.border.gamma_multiply(0.4)
+        };
+
+        ui.painter().rect_filled(row_rect, CornerRadius::same(6), fill_bg);
+        ui.painter().rect_stroke(
+            row_rect,
+            CornerRadius::same(6),
+            Stroke::new(1.0_f32, border_col),
+            StrokeKind::Inside,
+        );
+
+        if hovered {
+            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+        }
+        if row_resp.clicked() {
+            self.files_selected = Some(path.clone());
+        }
+        if row_resp.double_clicked() {
+            if is_dir {
+                do_load_dir = Some(path.clone());
+            } else {
+                do_download = Some((path.clone(), name.clone()));
+            }
+        }
+
+        // 右键上下文菜单（彻底对齐 Netcatty 现代文件管理器交互）
+        row_resp.context_menu(|ui| {
+            ui.set_min_width(140.0);
+            if is_dir {
+                if ui.button("📂 进入文件夹").clicked() {
+                    do_load_dir = Some(path.clone());
+                    ui.close_menu();
+                }
+            } else {
+                if ui.button("📥 下载文件").clicked() {
+                    do_download = Some((path.clone(), name.clone()));
+                    ui.close_menu();
+                }
+            }
+            if ui.button("✏️ 重命名").clicked() {
+                do_rename = Some((path.clone(), name.clone()));
+                ui.close_menu();
+            }
+            if ui.button("🔒 修改权限 (chmod)").clicked() {
+                do_chmod = Some((path.clone(), mode_text.clone()));
+                ui.close_menu();
+            }
+            if ui.button("📋 复制绝对路径").clicked() {
+                do_copy_path = Some(path.clone());
+                ui.close_menu();
+            }
+            ui.separator();
+            if ui.button(RichText::new("🗑️ 删除").color(p.danger)).clicked() {
+                do_delete = Some((path.clone(), is_dir));
+                ui.close_menu();
+            }
+        });
+
+        // 绘制行内元素：左侧图标 + 文件名，右侧大小 + 权限 + 时间
+        let icon = if is_dir {
+            Icon::Folder
+        } else if kind == "symlink" {
+            Icon::Link
+        } else {
+            Icon::File
+        };
+        let ico_pos = Pos2::new(row_rect.min.x + 16.0, row_rect.center().y);
+        draw_icon(
+            ui.painter(),
+            ico_pos,
+            13.0,
+            icon,
+            if is_dir { p.warn } else if kind == "symlink" { p.accent } else { p.dim },
+        );
+
+        let text_left = row_rect.min.x + 32.0;
+        let right_info_w = 260.0;
+        let name_clip = Rect::from_min_max(
+            Pos2::new(text_left, row_rect.min.y),
+            Pos2::new((row_rect.max.x - right_info_w - 8.0).max(text_left + 40.0), row_rect.max.y),
+        );
+        let name_painter = ui.painter().with_clip_rect(name_clip);
+        name_painter.text(
+            Pos2::new(text_left, row_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            &name,
+            FontId::proportional(12.5),
+            if selected { p.accent } else { p.text },
+        );
+
+        // 右侧指标列：大小 (70px) · 权限 (50px) · 修改时间 (130px)
+        let size_text = if is_dir { "—".to_string() } else { human_size(size) };
+        let right_x = row_rect.max.x - 12.0;
+        ui.painter().text(
+            Pos2::new(right_x, row_rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            &mtime,
+            FontId::monospace(10.5),
+            p.faint,
+        );
+        ui.painter().text(
+            Pos2::new(right_x - 130.0, row_rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            &perms,
+            FontId::monospace(10.5),
+            p.faint,
+        );
+        ui.painter().text(
+            Pos2::new(right_x - 190.0, row_rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            size_text,
+            FontId::monospace(10.5),
+            p.dim,
+        );
+
+        ui.add_space(3.0);
+
+        if let Some(target) = do_load_dir {
+            self.load_files(target);
+        }
+        if let Some((p, n)) = do_download {
+            self.pick_and_download(p, n);
+        }
+        if let Some((from, name)) = do_rename {
+            self.drawer = Drawer::FileRename { from, name };
+        }
+        if let Some((path, mode)) = do_chmod {
+            self.drawer = Drawer::FileChmod { path, mode };
+        }
+        if let Some(cp) = do_copy_path {
+            self.copy_to_clipboard(&cp, "文件路径");
+        }
+        if let Some((del_path, del_is_dir)) = do_delete {
+            self.open_file_remove(del_path, del_is_dir);
+        }
     }
 
     fn render_transfers(&mut self, ui: &mut egui::Ui) {
@@ -4187,7 +4622,7 @@ impl KwDesktopApp {
                 ui.horizontal_top(|ui| {
                     ui.spacing_mut().item_spacing.x = row_gap;
                     mon_net_card(ui, &p, left_w, s, &down_hist, &up_hist, peak_down, peak_up);
-                    mon_procs_card(ui, &p, right_w, s);
+                    mon_procs_card(ui, &p, right_w, s, &mut self.mon_sort_by_mem);
                 });
 
                 ui.add_space(10.0);
@@ -4310,7 +4745,7 @@ impl KwDesktopApp {
         let card_w = ((avail_w - (cols.saturating_sub(1) as f32) * gap) / (cols as f32))
             .floor()
             .max(220.0);
-        let card_h = 108.0;
+        let card_h = 116.0;
 
         let total_items = filtered.len();
         if total_items == 0 {
@@ -4392,6 +4827,7 @@ impl KwDesktopApp {
 
         let mut pending_edit: Option<Option<HostEntry>> = None;
         let mut pending_connect: Option<(HostEntry, ViewMode)> = None;
+        let mut copy_text: Option<(String, &'static str)> = None;
 
         let mut row_idx = 0;
         while row_idx * cols < total_items {
@@ -4420,26 +4856,77 @@ impl KwDesktopApp {
                         .to_uppercase()
                         .to_string();
 
-                    // 子按钮矩形定义（绝对坐标，杜绝任何水平/垂直挤压重叠）
+                    // 整卡可交互响应（单击/双击直连终端，右键弹出完整菜单，Netcatty 风格）
+                    let card_resp = ui.interact(
+                        card_rect,
+                        ui.id().with(("card_main", item_i)),
+                        Sense::click(),
+                    );
+                    let card_hovered = card_resp.hovered();
+
+                    let h_menu = h.clone();
+                    card_resp.context_menu(|ui| {
+                        ui.set_min_width(150.0);
+                        if ui.button("⚡ 连接终端 (SSH)").clicked() {
+                            pending_connect = Some((h_menu.clone(), ViewMode::Term));
+                            ui.close_menu();
+                        }
+                        if ui.button("📁 打开文件 (SFTP)").clicked() {
+                            pending_connect = Some((h_menu.clone(), ViewMode::Files));
+                            ui.close_menu();
+                        }
+                        if ui.button("📊 打开状态监控").clicked() {
+                            pending_connect = Some((h_menu.clone(), ViewMode::Monitor));
+                            ui.close_menu();
+                        }
+                        if ui.button("🔑 管理 authorized_keys").clicked() {
+                            pending_connect = Some((h_menu.clone(), ViewMode::Keys));
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("📋 复制 SSH 连接命令").clicked() {
+                            let cmd = format!("ssh -p {} {}@{}", h_menu.port, h_menu.username, h_menu.host);
+                            copy_text = Some((cmd, "SSH 命令"));
+                            ui.close_menu();
+                        }
+                        if ui.button("✏️ 编辑服务器配置").clicked() {
+                            pending_edit = Some(Some(h_menu.clone()));
+                            ui.close_menu();
+                        }
+                    });
+
+                    // 方案 A 现代极简卡片布局
                     let av_rect = Rect::from_min_size(
-                        Pos2::new(card_rect.min.x + 14.0, card_rect.min.y + 13.0),
+                        Pos2::new(card_rect.min.x + 13.0, card_rect.min.y + 13.0),
                         Vec2::new(38.0, 38.0),
                     );
                     let edit_rect = Rect::from_min_size(
-                        Pos2::new(card_rect.max.x - 66.0, card_rect.min.y + 13.0),
-                        Vec2::new(52.0, 24.0),
+                        Pos2::new(card_rect.max.x - 36.0, card_rect.min.y + 13.0),
+                        Vec2::new(24.0, 24.0),
                     );
+
+                    let compact_btns = card_w < 335.0;
+                    let term_w = if compact_btns { 52.0 } else { 58.0 };
+                    let aux_w = if compact_btns { 32.0 } else { 54.0 };
+                    let btn_gap = 5.0;
+
                     let term_rect = Rect::from_min_size(
-                        Pos2::new(card_rect.max.x - 78.0, card_rect.max.y - 35.0),
-                        Vec2::new(64.0, 26.0),
+                        Pos2::new(card_rect.max.x - 13.0 - term_w, card_rect.max.y - 35.0),
+                        Vec2::new(term_w, 24.0),
+                    );
+                    let mon_rect = Rect::from_min_size(
+                        Pos2::new(term_rect.min.x - btn_gap - aux_w, card_rect.max.y - 35.0),
+                        Vec2::new(aux_w, 24.0),
                     );
                     let files_rect = Rect::from_min_size(
-                        Pos2::new(card_rect.max.x - 136.0, card_rect.max.y - 35.0),
-                        Vec2::new(52.0, 26.0),
+                        Pos2::new(mon_rect.min.x - btn_gap - aux_w, card_rect.max.y - 35.0),
+                        Vec2::new(aux_w, 24.0),
                     );
-                    let keys_rect = Rect::from_min_size(
-                        Pos2::new(card_rect.max.x - 202.0, card_rect.max.y - 35.0),
-                        Vec2::new(60.0, 26.0),
+
+                    let ep_str = format!("{}@{}:{}", h.username, h.host, h.port);
+                    let ep_rect = Rect::from_min_size(
+                        Pos2::new(av_rect.max.x + 10.0, card_rect.min.y + 36.0),
+                        Vec2::new((card_rect.width() - 80.0).max(60.0), 18.0),
                     );
 
                     let edit_resp = ui
@@ -4449,6 +4936,13 @@ impl KwDesktopApp {
                             Sense::click(),
                         )
                         .on_hover_text("编辑此服务器配置");
+                    let ep_resp = ui
+                        .interact(
+                            ep_rect,
+                            ui.id().with(("card_ep", item_i)),
+                            Sense::click(),
+                        )
+                        .on_hover_text(format!("点击复制端点地址：{ep_str}"));
                     let term_resp = ui
                         .interact(
                             term_rect,
@@ -4456,31 +4950,35 @@ impl KwDesktopApp {
                             Sense::click(),
                         )
                         .on_hover_text("直连打开交互式 SSH 终端");
+                    let mon_resp = ui
+                        .interact(
+                            mon_rect,
+                            ui.id().with(("card_mon", item_i)),
+                            Sense::click(),
+                        )
+                        .on_hover_text("连接并查看服务器资源监控");
                     let files_resp = ui
                         .interact(
                             files_rect,
                             ui.id().with(("card_files", item_i)),
                             Sense::click(),
                         )
-                        .on_hover_text("连接并浏览远端文件");
-                    let keys_resp = ui
-                        .interact(
-                            keys_rect,
-                            ui.id().with(("card_keys", item_i)),
-                            Sense::click(),
-                        )
-                        .on_hover_text("连接并管理远端 authorized_keys");
+                        .on_hover_text("连接并浏览远端文件 (SFTP)");
 
-                    let card_hovered = ui.rect_contains_pointer(card_rect);
                     let border_col = if card_hovered {
-                        p.accent.gamma_multiply(0.65)
+                        p.accent
                     } else {
                         p.border
+                    };
+                    let card_bg = if card_hovered {
+                        p.surface3
+                    } else {
+                        p.panel
                     };
 
                     // 1. 卡片背景与边框
                     ui.painter()
-                        .rect_filled(card_rect, CornerRadius::same(11), p.panel);
+                        .rect_filled(card_rect, CornerRadius::same(11), card_bg);
                     ui.painter().rect_stroke(
                         card_rect,
                         CornerRadius::same(11),
@@ -4488,105 +4986,138 @@ impl KwDesktopApp {
                         StrokeKind::Inside,
                     );
 
-                    // 2. 左侧首字母头像方块
+                    // 2. 左侧首字母/NAS 图标头像方块（带呼吸绿点）
                     ui.painter()
-                        .rect_filled(av_rect, CornerRadius::same(9), p.accent_soft);
+                        .rect_filled(av_rect, CornerRadius::same(10), p.accent_soft);
                     ui.painter().rect_stroke(
                         av_rect,
-                        CornerRadius::same(9),
-                        Stroke::new(1.0_f32, p.accent.gamma_multiply(0.4)),
+                        CornerRadius::same(10),
+                        Stroke::new(1.0_f32, p.accent.gamma_multiply(0.35)),
                         StrokeKind::Inside,
                     );
-                    ui.painter().text(
-                        av_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        &first_ch,
-                        FontId::proportional(15.5),
-                        p.accent,
-                    );
+                    let is_nas = h.name.to_lowercase().contains("nas") || h.name.to_lowercase().contains("fnos");
+                    if is_nas {
+                        draw_icon(ui.painter(), av_rect.center(), 18.0, Icon::Server, p.accent);
+                    } else {
+                        ui.painter().text(
+                            av_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            &first_ch,
+                            FontId::proportional(15.5),
+                            p.accent,
+                        );
+                    }
+                    let status_dot = Pos2::new(av_rect.max.x - 3.5, av_rect.min.y + 3.5);
+                    ui.painter().circle_filled(status_dot, 3.5, p.bg);
+                    ui.painter().circle_filled(status_dot, 2.5, Color32::from_rgb(0x10, 0xB9, 0x81));
 
-                    // 3. 主机名称与 user@host:port（带文字裁剪区，绝不越界覆盖右侧编辑图标）
+                    // 3. 业务微标签识别
+                    let tag: Option<&'static str> = if h.host.starts_with("192.168.")
+                        || h.host.starts_with("10.")
+                        || h.host.starts_with("127.")
+                        || h.host.starts_with("172.16.")
+                    {
+                        Some("局域网")
+                    } else if h.name.to_lowercase().contains("nas") || h.name.to_lowercase().contains("fnos") {
+                        Some("NAS")
+                    } else if h.name.to_lowercase().contains("singapore") || h.name.to_lowercase().contains("sg") {
+                        Some("新加坡")
+                    } else if h.name.to_lowercase().contains("hk") {
+                        Some("香港")
+                    } else if h.name.to_lowercase().contains("jp") || h.name.to_lowercase().contains("tokyo") {
+                        Some("日本")
+                    } else {
+                        None
+                    };
+
+                    // 主机名称与 user@host:port
                     let text_clip = Rect::from_min_max(
                         Pos2::new(av_rect.max.x + 10.0, card_rect.min.y + 10.0),
-                        Pos2::new(edit_rect.min.x - 4.0, card_rect.min.y + 56.0),
+                        Pos2::new(edit_rect.min.x - 4.0, card_rect.min.y + 58.0),
                     );
                     let text_painter = ui.painter().with_clip_rect(text_clip);
+                    let name_col = if card_hovered { p.accent } else { p.text };
                     text_painter.text(
                         Pos2::new(av_rect.max.x + 10.0, card_rect.min.y + 22.0),
                         egui::Align2::LEFT_CENTER,
                         &name,
                         FontId::proportional(13.5),
-                        p.text,
-                    );
-                    text_painter.text(
-                        Pos2::new(av_rect.max.x + 10.0, card_rect.min.y + 41.0),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{}@{}:{}", h.username, h.host, h.port),
-                        FontId::monospace(11.5),
-                        p.dim,
+                        name_col,
                     );
 
-                    // 4. 右上角「编辑」胶囊按钮（带矢量铅笔图标 + 文字标签 + 边框）
-                    let edit_bg = if edit_resp.hovered() {
-                        p.accent_soft
-                    } else {
-                        p.surface3
-                    };
-                    let edit_border = if edit_resp.hovered() {
-                        p.accent
-                    } else {
-                        p.border
-                    };
-                    let edit_fg = if edit_resp.hovered() { p.accent } else { p.dim };
-                    ui.painter()
-                        .rect_filled(edit_rect, CornerRadius::same(6), edit_bg);
-                    ui.painter().rect_stroke(
-                        edit_rect,
-                        CornerRadius::same(6),
-                        Stroke::new(1.0_f32, edit_border),
-                        StrokeKind::Inside,
-                    );
-                    draw_icon(
-                        ui.painter(),
-                        Pos2::new(edit_rect.min.x + 12.5, edit_rect.center().y),
-                        11.5,
-                        Icon::Edit,
-                        edit_fg,
-                    );
-                    ui.painter().text(
-                        Pos2::new(edit_rect.min.x + 22.0, edit_rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        "编辑",
-                        FontId::proportional(11.0),
-                        if edit_resp.hovered() {
-                            p.accent
-                        } else {
-                            p.text
-                        },
-                    );
-                    if edit_resp.hovered() {
-                        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+                    // 业务微标签（若存在）
+                    if let Some(tag_str) = tag {
+                        let name_len_est = (name.len() as f32).min(12.0) * 8.5;
+                        let tag_x = av_rect.max.x + 10.0 + name_len_est + 8.0;
+                        if tag_x + 38.0 < edit_rect.min.x {
+                            let tag_rect = Rect::from_min_size(
+                                Pos2::new(tag_x, card_rect.min.y + 14.0),
+                                Vec2::new(38.0, 16.0),
+                            );
+                            ui.painter().rect_filled(tag_rect, CornerRadius::same(4), p.surface2);
+                            ui.painter().rect_stroke(
+                                tag_rect,
+                                CornerRadius::same(4),
+                                Stroke::new(1.0_f32, p.border),
+                                StrokeKind::Inside,
+                            );
+                            ui.painter().text(
+                                tag_rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                tag_str,
+                                FontId::proportional(9.5),
+                                p.dim,
+                            );
+                        }
                     }
 
+                    // 端点地址展示（悬停高亮）
+                    let ep_fg = if ep_resp.hovered() { p.accent } else { p.dim };
+                    text_painter.text(
+                        Pos2::new(av_rect.max.x + 10.0, card_rect.min.y + 42.0),
+                        egui::Align2::LEFT_CENTER,
+                        &ep_str,
+                        FontId::monospace(11.0),
+                        ep_fg,
+                    );
+
+                    // 4. 右上角「编辑」轻量图标按钮
+                    if edit_resp.hovered() {
+                        ui.painter().rect_filled(edit_rect, CornerRadius::same(6), p.surface2);
+                        ui.painter().rect_stroke(
+                            edit_rect,
+                            CornerRadius::same(6),
+                            Stroke::new(1.0_f32, p.border),
+                            StrokeKind::Inside,
+                        );
+                    }
+                    draw_icon(
+                        ui.painter(),
+                        edit_rect.center(),
+                        12.5,
+                        Icon::Edit,
+                        if edit_resp.hovered() { p.accent } else { p.faint },
+                    );
+
                     // 5. 卡片内部分隔细线
-                    let div_y = card_rect.min.y + 62.0;
+                    let div_y = card_rect.min.y + 64.0;
                     ui.painter().line_segment(
                         [
-                            Pos2::new(card_rect.min.x + 14.0, div_y),
-                            Pos2::new(card_rect.max.x - 14.0, div_y),
+                            Pos2::new(card_rect.min.x + 13.0, div_y),
+                            Pos2::new(card_rect.max.x - 13.0, div_y),
                         ],
-                        Stroke::new(1.0_f32, p.border.gamma_multiply(0.6)),
+                        Stroke::new(1.0_f32, p.border.gamma_multiply(0.45)),
                     );
 
                     // 6. 左下角认证方式徽章
                     let has_key = !h.identity_file.trim().is_empty()
                         || !h.identity_fingerprint.trim().is_empty();
                     let badge_rect = Rect::from_min_size(
-                        Pos2::new(card_rect.min.x + 14.0, card_rect.max.y - 34.0),
-                        Vec2::new(62.0, 24.0),
+                        Pos2::new(card_rect.min.x + 13.0, card_rect.max.y - 34.0),
+                        Vec2::new(56.0, 22.0),
                     );
                     ui.painter()
-                        .rect_filled(badge_rect, CornerRadius::same(6), p.surface3);
+                        .rect_filled(badge_rect, CornerRadius::same(6), p.surface2);
                     ui.painter().rect_stroke(
                         badge_rect,
                         CornerRadius::same(6),
@@ -4595,16 +5126,16 @@ impl KwDesktopApp {
                     );
                     draw_icon(
                         ui.painter(),
-                        Pos2::new(badge_rect.min.x + 13.0, badge_rect.center().y),
-                        11.5,
+                        Pos2::new(badge_rect.min.x + 11.5, badge_rect.center().y),
+                        11.0,
                         if has_key { Icon::Key } else { Icon::Lock },
                         if has_key { p.accent } else { p.dim },
                     );
                     ui.painter().text(
-                        Pos2::new(badge_rect.min.x + 24.0, badge_rect.center().y),
+                        Pos2::new(badge_rect.min.x + 22.0, badge_rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         if has_key { "密钥" } else { "密码" },
-                        FontId::proportional(11.0),
+                        FontId::proportional(10.5),
                         p.dim,
                     );
 
@@ -4614,10 +5145,10 @@ impl KwDesktopApp {
                         } else {
                             "SOCKS5"
                         };
-                        let chip_w = if kind == "HTTP" { 46.0 } else { 56.0 };
+                        let chip_w = if kind == "HTTP" { 42.0 } else { 52.0 };
                         let proxy_rect = Rect::from_min_size(
-                            Pos2::new(badge_rect.max.x + 6.0, badge_rect.min.y),
-                            Vec2::new(chip_w, 24.0),
+                            Pos2::new(badge_rect.max.x + 5.0, badge_rect.min.y),
+                            Vec2::new(chip_w, 22.0),
                         );
                         ui.painter()
                             .rect_filled(proxy_rect, CornerRadius::same(6), p.accent_soft);
@@ -4636,49 +5167,12 @@ impl KwDesktopApp {
                         );
                     }
 
-                    // 7. 右下角「密钥」按钮
-                    let keys_bg = if keys_resp.hovered() {
-                        p.accent_soft
-                    } else {
-                        p.surface3
-                    };
-                    let keys_border = if keys_resp.hovered() {
-                        p.accent
-                    } else {
-                        p.border
-                    };
-                    ui.painter()
-                        .rect_filled(keys_rect, CornerRadius::same(7), keys_bg);
-                    ui.painter().rect_stroke(
-                        keys_rect,
-                        CornerRadius::same(7),
-                        Stroke::new(1.0_f32, keys_border),
-                        StrokeKind::Inside,
-                    );
-                    draw_icon(
-                        ui.painter(),
-                        Pos2::new(keys_rect.min.x + 15.0, keys_rect.center().y),
-                        12.0,
-                        Icon::Shield,
-                        if keys_resp.hovered() { p.accent } else { p.dim },
-                    );
-                    ui.painter().text(
-                        Pos2::new(keys_rect.min.x + 27.0, keys_rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        "密钥",
-                        FontId::proportional(12.0),
-                        if keys_resp.hovered() {
-                            p.accent
-                        } else {
-                            p.text
-                        },
-                    );
-
-                    // 7.5 右下角「文件」按钮
+                    // 7. 右下角动作按钮组：文件(SFTP) + 监控(Monitor) + 终端(SSH)
+                    // 7.1 文件按钮
                     let files_bg = if files_resp.hovered() {
                         p.accent_soft
                     } else {
-                        p.surface3
+                        p.surface2
                     };
                     let files_border = if files_resp.hovered() {
                         p.accent
@@ -4686,62 +5180,110 @@ impl KwDesktopApp {
                         p.border
                     };
                     ui.painter()
-                        .rect_filled(files_rect, CornerRadius::same(7), files_bg);
+                        .rect_filled(files_rect, CornerRadius::same(6), files_bg);
                     ui.painter().rect_stroke(
                         files_rect,
-                        CornerRadius::same(7),
+                        CornerRadius::same(6),
                         Stroke::new(1.0_f32, files_border),
                         StrokeKind::Inside,
                     );
-                    draw_icon(
-                        ui.painter(),
-                        Pos2::new(files_rect.min.x + 13.0, files_rect.center().y),
-                        12.0,
-                        Icon::Folder,
-                        if files_resp.hovered() {
-                            p.accent
-                        } else {
-                            p.dim
-                        },
-                    );
-                    ui.painter().text(
-                        Pos2::new(files_rect.min.x + 24.0, files_rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        "文件",
-                        FontId::proportional(12.0),
-                        if files_resp.hovered() {
-                            p.accent
-                        } else {
-                            p.text
-                        },
-                    );
+                    if compact_btns {
+                        draw_icon(
+                            ui.painter(),
+                            files_rect.center(),
+                            11.5,
+                            Icon::Folder,
+                            if files_resp.hovered() { p.accent } else { p.dim },
+                        );
+                    } else {
+                        draw_icon(
+                            ui.painter(),
+                            Pos2::new(files_rect.min.x + 12.0, files_rect.center().y),
+                            11.5,
+                            Icon::Folder,
+                            if files_resp.hovered() { p.accent } else { p.dim },
+                        );
+                        ui.painter().text(
+                            Pos2::new(files_rect.min.x + 22.5, files_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "文件",
+                            FontId::proportional(11.0),
+                            if files_resp.hovered() { p.accent } else { p.text },
+                        );
+                    }
 
-                    // 8. 右下角「终端」主按钮
+                    // 7.2 监控按钮
+                    let mon_bg = if mon_resp.hovered() {
+                        p.accent_soft
+                    } else {
+                        p.surface2
+                    };
+                    let mon_border = if mon_resp.hovered() {
+                        p.accent
+                    } else {
+                        p.border
+                    };
+                    ui.painter()
+                        .rect_filled(mon_rect, CornerRadius::same(6), mon_bg);
+                    ui.painter().rect_stroke(
+                        mon_rect,
+                        CornerRadius::same(6),
+                        Stroke::new(1.0_f32, mon_border),
+                        StrokeKind::Inside,
+                    );
+                    if compact_btns {
+                        draw_icon(
+                            ui.painter(),
+                            mon_rect.center(),
+                            11.5,
+                            Icon::Pulse,
+                            if mon_resp.hovered() { p.accent } else { p.dim },
+                        );
+                    } else {
+                        draw_icon(
+                            ui.painter(),
+                            Pos2::new(mon_rect.min.x + 12.0, mon_rect.center().y),
+                            11.5,
+                            Icon::Pulse,
+                            if mon_resp.hovered() { p.accent } else { p.dim },
+                        );
+                        ui.painter().text(
+                            Pos2::new(mon_rect.min.x + 22.5, mon_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "监控",
+                            FontId::proportional(11.0),
+                            if mon_resp.hovered() { p.accent } else { p.text },
+                        );
+                    }
+
+                    // 7.3 终端主按钮
                     let term_bg = if term_resp.hovered() {
                         p.accent.gamma_multiply(0.88)
                     } else {
                         p.accent
                     };
                     ui.painter()
-                        .rect_filled(term_rect, CornerRadius::same(7), term_bg);
+                        .rect_filled(term_rect, CornerRadius::same(6), term_bg);
                     draw_icon(
                         ui.painter(),
-                        Pos2::new(term_rect.min.x + 15.0, term_rect.center().y),
-                        12.0,
+                        Pos2::new(term_rect.min.x + 13.0, term_rect.center().y),
+                        11.5,
                         Icon::Terminal,
                         Color32::WHITE,
                     );
                     ui.painter().text(
-                        Pos2::new(term_rect.min.x + 27.0, term_rect.center().y),
+                        Pos2::new(term_rect.min.x + 23.5, term_rect.center().y),
                         egui::Align2::LEFT_CENTER,
                         "终端",
-                        FontId::proportional(12.0),
+                        FontId::proportional(11.5),
                         Color32::WHITE,
                     );
 
-                    if edit_resp.hovered()
-                        || keys_resp.hovered()
+                    if card_hovered
+                        || edit_resp.hovered()
+                        || ep_resp.hovered()
                         || files_resp.hovered()
+                        || mon_resp.hovered()
                         || term_resp.hovered()
                     {
                         ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
@@ -4749,12 +5291,17 @@ impl KwDesktopApp {
 
                     if edit_resp.clicked() {
                         pending_edit = Some(Some(h));
+                    } else if ep_resp.clicked() {
+                        copy_text = Some((ep_str, "端点地址"));
                     } else if term_resp.clicked() {
                         pending_connect = Some((h, ViewMode::Term));
+                    } else if mon_resp.clicked() {
+                        pending_connect = Some((h, ViewMode::Monitor));
                     } else if files_resp.clicked() {
                         pending_connect = Some((h, ViewMode::Files));
-                    } else if keys_resp.clicked() {
-                        pending_connect = Some((h, ViewMode::Keys));
+                    } else if card_resp.clicked() {
+                        // Netcatty 体验：点击卡片任意非按钮区域直接连接终端
+                        pending_connect = Some((h, ViewMode::Term));
                     }
                 }
             }
@@ -4763,6 +5310,9 @@ impl KwDesktopApp {
             row_idx += 1;
         }
 
+        if let Some((txt, label)) = copy_text {
+            self.copy_to_clipboard(&txt, label);
+        }
         if let Some(ed) = pending_edit {
             self.open_host_edit(ed);
         }
@@ -4815,35 +5365,68 @@ impl KwDesktopApp {
             }
         }
 
+        // 终端画布配色（跟随主题色自由变化：曜石深色 / 亚麻浅色；无边框聚焦）
+        let (term_bg_col, term_fg_col) = (p.surface2, p.text);
+
         let (term_rect, term_resp) = ui.allocate_exact_size(avail, Sense::click_and_drag());
 
         ui.painter()
-            .rect_filled(term_rect, CornerRadius::same(10), p.surface2);
-        ui.painter().rect_stroke(
-            term_rect,
-            CornerRadius::same(10),
-            Stroke::new(
-                1.0_f32,
-                if self.term_focused {
-                    p.accent
-                } else {
-                    p.border
-                },
-            ),
-            StrokeKind::Inside,
-        );
+            .rect_filled(term_rect, CornerRadius::same(10), term_bg_col);
 
-        if term_resp.clicked() {
+        let origin = Pos2::new(term_rect.min.x + pad_x, term_rect.min.y + pad_y);
+        let hist_len = self.vt.history().len();
+        let grid_len = self.vt.grid().len();
+        let rows = self.vt.rows();
+        let cols = self.vt.cols();
+        let total_lines = hist_len + grid_len;
+        let start_line = total_lines
+            .saturating_sub(rows)
+            .saturating_sub(self.term_scroll_offset.min(hist_len));
+
+        if term_resp.clicked() && !term_resp.dragged() {
             self.term_focused = true;
             term_resp.request_focus();
+            self.term_selection = None;
+            self.term_drag_start = None;
         } else if ui.input(|i| i.pointer.any_pressed()) && !term_resp.hovered() {
             self.term_focused = false;
         }
 
+        // 鼠标拖拽划选终端文本
+        if let Some(pos) = ui.input(|i| i.pointer.interact_pos()) {
+            if term_rect.contains(pos) {
+                let vis_r = ((pos.y - origin.y) / line_h).floor() as isize;
+                let c_idx = ((pos.x - origin.x) / char_w).floor() as isize;
+                if vis_r >= 0 && vis_r < rows as isize && c_idx >= 0 {
+                    let abs_line = (start_line as isize + vis_r)
+                        .clamp(0, total_lines.saturating_sub(1) as isize) as usize;
+                    let abs_col = (c_idx as usize).min(cols.saturating_sub(1));
+                    if term_resp.drag_started() {
+                        self.term_drag_start = Some((abs_line, abs_col));
+                        self.term_selection = Some(((abs_line, abs_col), (abs_line, abs_col)));
+                    } else if term_resp.dragged() {
+                        if let Some(start) = self.term_drag_start {
+                            self.term_selection = Some((start, (abs_line, abs_col)));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 右键：有选区则复制选中文本，无选区则粘贴剪贴板
         if term_resp.secondary_clicked() {
-            let txt = self.read_from_clipboard();
-            if !txt.is_empty() {
-                self.send_term_bytes(txt.as_bytes());
+            if let Some((p1, p2)) = self.term_selection.take() {
+                if p1 != p2 {
+                    let txt = self.vt.text_in_range(p1, p2);
+                    if !txt.is_empty() {
+                        self.copy_to_clipboard(&txt, "选中文本");
+                    }
+                }
+            } else {
+                let txt = self.read_from_clipboard();
+                if !txt.is_empty() {
+                    self.send_term_paste(&txt);
+                }
             }
         }
 
@@ -4871,14 +5454,17 @@ impl KwDesktopApp {
             });
 
             let mut to_send: Vec<u8> = Vec::new();
+            let mut copy_selection = false;
+            let mut do_paste = false;
+            let mut paste_text: Option<String> = None;
             ui.input(|input| {
                 for ev in &input.events {
                     match ev {
                         Event::Paste(s) => {
-                            to_send.extend_from_slice(s.as_bytes());
+                            paste_text = Some(s.clone());
                         }
                         Event::Text(s) => {
-                            if !input.modifiers.ctrl && !input.modifiers.command {
+                            if !input.modifiers.ctrl && !input.modifiers.command && !input.modifiers.alt {
                                 to_send.extend_from_slice(s.as_bytes());
                             }
                         }
@@ -4888,18 +5474,53 @@ impl KwDesktopApp {
                             modifiers,
                             ..
                         } => {
-                            if modifiers.ctrl {
+                            // Ctrl + Shift + C -> 复制选区
+                            if modifiers.ctrl && modifiers.shift && *key == Key::C {
+                                copy_selection = true;
+                            } else if (modifiers.ctrl && modifiers.shift && *key == Key::V)
+                                || (modifiers.shift && *key == Key::Insert)
+                            {
+                                do_paste = true;
+                            } else if modifiers.ctrl && !modifiers.shift {
                                 match key {
+                                    Key::A => to_send.push(0x01),
+                                    Key::B => to_send.push(0x02),
                                     Key::C => to_send.push(0x03),
                                     Key::D => to_send.push(0x04),
-                                    Key::Z => to_send.push(0x1a),
-                                    Key::L => to_send.push(0x0c),
-                                    Key::A => to_send.push(0x01),
                                     Key::E => to_send.push(0x05),
-                                    Key::U => to_send.push(0x15),
+                                    Key::F => to_send.push(0x06),
+                                    Key::G => to_send.push(0x07),
+                                    Key::H => to_send.push(0x08),
+                                    Key::I => to_send.push(0x09),
+                                    Key::J => to_send.push(0x0a),
                                     Key::K => to_send.push(0x0b),
-                                    Key::W => to_send.push(0x17),
+                                    Key::L => to_send.push(0x0c),
+                                    Key::M => to_send.push(0x0d),
+                                    Key::N => to_send.push(0x0e),
+                                    Key::O => to_send.push(0x0f),
+                                    Key::P => to_send.push(0x10),
+                                    Key::Q => to_send.push(0x11),
                                     Key::R => to_send.push(0x12),
+                                    Key::S => to_send.push(0x13),
+                                    Key::T => to_send.push(0x14),
+                                    Key::U => to_send.push(0x15),
+                                    Key::V => to_send.push(0x16),
+                                    Key::W => to_send.push(0x17),
+                                    Key::X => to_send.push(0x18),
+                                    Key::Y => to_send.push(0x19),
+                                    Key::Z => to_send.push(0x1a),
+                                    Key::OpenBracket => to_send.push(0x1b),
+                                    Key::Backslash => to_send.push(0x1c),
+                                    Key::CloseBracket => to_send.push(0x1d),
+                                    Key::Space => to_send.push(0x00),
+                                    _ => {}
+                                }
+                            } else if modifiers.alt && !modifiers.ctrl {
+                                match key {
+                                    Key::B => to_send.extend_from_slice(b"\x1bb"),
+                                    Key::F => to_send.extend_from_slice(b"\x1bf"),
+                                    Key::D => to_send.extend_from_slice(b"\x1bd"),
+                                    Key::Backspace => to_send.extend_from_slice(b"\x1b\x7f"),
                                     _ => {}
                                 }
                             } else {
@@ -4908,15 +5529,64 @@ impl KwDesktopApp {
                                     Key::Backspace => to_send.push(0x7f),
                                     Key::Tab => to_send.push(b'\t'),
                                     Key::Escape => to_send.push(0x1b),
-                                    Key::ArrowUp => to_send.extend_from_slice(b"\x1b[A"),
-                                    Key::ArrowDown => to_send.extend_from_slice(b"\x1b[B"),
-                                    Key::ArrowRight => to_send.extend_from_slice(b"\x1b[C"),
-                                    Key::ArrowLeft => to_send.extend_from_slice(b"\x1b[D"),
-                                    Key::Home => to_send.extend_from_slice(b"\x1b[H"),
-                                    Key::End => to_send.extend_from_slice(b"\x1b[F"),
+                                    Key::ArrowUp => {
+                                        if self.vt.app_cursor {
+                                            to_send.extend_from_slice(b"\x1bOA");
+                                        } else {
+                                            to_send.extend_from_slice(b"\x1b[A");
+                                        }
+                                    }
+                                    Key::ArrowDown => {
+                                        if self.vt.app_cursor {
+                                            to_send.extend_from_slice(b"\x1bOB");
+                                        } else {
+                                            to_send.extend_from_slice(b"\x1b[B");
+                                        }
+                                    }
+                                    Key::ArrowRight => {
+                                        if self.vt.app_cursor {
+                                            to_send.extend_from_slice(b"\x1bOC");
+                                        } else {
+                                            to_send.extend_from_slice(b"\x1b[C");
+                                        }
+                                    }
+                                    Key::ArrowLeft => {
+                                        if self.vt.app_cursor {
+                                            to_send.extend_from_slice(b"\x1bOD");
+                                        } else {
+                                            to_send.extend_from_slice(b"\x1b[D");
+                                        }
+                                    }
+                                    Key::Home => {
+                                        if self.vt.app_cursor {
+                                            to_send.extend_from_slice(b"\x1bOH");
+                                        } else {
+                                            to_send.extend_from_slice(b"\x1b[H");
+                                        }
+                                    }
+                                    Key::End => {
+                                        if self.vt.app_cursor {
+                                            to_send.extend_from_slice(b"\x1bOF");
+                                        } else {
+                                            to_send.extend_from_slice(b"\x1b[F");
+                                        }
+                                    }
+                                    Key::Insert => to_send.extend_from_slice(b"\x1b[2~"),
                                     Key::Delete => to_send.extend_from_slice(b"\x1b[3~"),
                                     Key::PageUp => to_send.extend_from_slice(b"\x1b[5~"),
                                     Key::PageDown => to_send.extend_from_slice(b"\x1b[6~"),
+                                    Key::F1 => to_send.extend_from_slice(b"\x1bOP"),
+                                    Key::F2 => to_send.extend_from_slice(b"\x1bOQ"),
+                                    Key::F3 => to_send.extend_from_slice(b"\x1bOR"),
+                                    Key::F4 => to_send.extend_from_slice(b"\x1bOS"),
+                                    Key::F5 => to_send.extend_from_slice(b"\x1b[15~"),
+                                    Key::F6 => to_send.extend_from_slice(b"\x1b[17~"),
+                                    Key::F7 => to_send.extend_from_slice(b"\x1b[18~"),
+                                    Key::F8 => to_send.extend_from_slice(b"\x1b[19~"),
+                                    Key::F9 => to_send.extend_from_slice(b"\x1b[20~"),
+                                    Key::F10 => to_send.extend_from_slice(b"\x1b[21~"),
+                                    Key::F11 => to_send.extend_from_slice(b"\x1b[23~"),
+                                    Key::F12 => to_send.extend_from_slice(b"\x1b[24~"),
                                     _ => {}
                                 }
                             }
@@ -4930,18 +5600,28 @@ impl KwDesktopApp {
                 self.term_scroll_offset = 0;
                 self.send_term_bytes(&to_send);
             }
+            if let Some(s) = paste_text {
+                self.send_term_paste(&s);
+            }
+            if copy_selection {
+                if let Some((p1, p2)) = self.term_selection {
+                    let txt = self.vt.text_in_range(p1, p2);
+                    if !txt.is_empty() {
+                        self.copy_to_clipboard(&txt, "选中文本");
+                    }
+                }
+            }
+            if do_paste {
+                let txt = self.read_from_clipboard();
+                if !txt.is_empty() {
+                    self.send_term_paste(&txt);
+                }
+            }
         }
 
-        let origin = Pos2::new(term_rect.min.x + pad_x, term_rect.min.y + pad_y);
-        let painter = ui.painter().with_clip_rect(term_rect.shrink(4.0));
         let hist = self.vt.history();
         let grid = self.vt.grid();
-        let rows = self.vt.rows();
-        let cols = self.vt.cols();
-        let total_lines = hist.len() + grid.len();
-        let start_line = total_lines
-            .saturating_sub(rows)
-            .saturating_sub(self.term_scroll_offset.min(hist.len()));
+        let painter = ui.painter().with_clip_rect(term_rect.shrink(4.0));
 
         for vis_r in 0..rows {
             let line_idx = start_line + vis_r;
@@ -4966,13 +5646,24 @@ impl KwDesktopApp {
                     char_w
                 };
                 let (mut fg, mut bg) = (
-                    cell.pen.fg.unwrap_or(p.text),
+                    cell.pen.fg.unwrap_or(term_fg_col),
                     cell.pen.bg.unwrap_or(Color32::TRANSPARENT),
                 );
                 if cell.pen.inverse {
                     std::mem::swap(&mut fg, &mut bg);
                     if fg == Color32::TRANSPARENT {
-                        fg = p.surface2;
+                        fg = term_bg_col;
+                    }
+                }
+                if let Some((p1, p2)) = self.term_selection {
+                    let (min_p, max_p) = if p1 <= p2 { (p1, p2) } else { (p2, p1) };
+                    let in_sel = (line_idx > min_p.0
+                        || (line_idx == min_p.0 && c_idx >= min_p.1))
+                        && (line_idx < max_p.0
+                            || (line_idx == max_p.0 && c_idx <= max_p.1));
+                    if in_sel {
+                        bg = p.accent.gamma_multiply(0.45);
+                        fg = Color32::WHITE;
                     }
                 }
                 if bg != Color32::TRANSPARENT {
@@ -4996,7 +5687,7 @@ impl KwDesktopApp {
             }
         }
 
-        if self.term_scroll_offset == 0 {
+        if self.term_scroll_offset == 0 && self.vt.cursor_visible {
             let (cx, cy) = self.vt.cursor();
             if cx < cols && cy < rows {
                 let cur_rect = Rect::from_min_size(
@@ -7223,6 +7914,20 @@ impl KwDesktopApp {
                         );
                         ui.checkbox(remember_key, "在本机记住加密口令");
 
+                        // 同步进行中 / 刚结束的反馈就贴在这里 —— 按钮旁边，
+                        // 而不是顶栏角落一个谁都不会注意的小圈。
+                        ui.add_space(10.0);
+                        if let Some(phase) = self.sync_phase {
+                            Self::draw_sync_progress(
+                                ui,
+                                &p,
+                                phase,
+                                self.sync_started.map(|t| t.elapsed()).unwrap_or_default(),
+                            );
+                        } else if let Some(out) = &self.sync_outcome {
+                            Self::draw_sync_outcome(ui, &p, out);
+                        }
+
                         if !conflicts.is_empty() {
                             ui.add_space(6.0);
                             ui.label(
@@ -7286,17 +7991,41 @@ impl KwDesktopApp {
                                     });
                                 }
                             } else {
-                                if Self::action_btn(ui, &p, "↻ 立即双向同步", true, false)
-                                    .clicked()
-                                {
+                                // 同步中置灰并换文案：点下去要立刻有反应，也顺手
+                                // 掐掉连点两次并发同步的可能。
+                                let running = self.sync_phase.is_some();
+                                let sync_label = if running {
+                                    "↻ 正在同步…"
+                                } else {
+                                    "↻ 立即双向同步"
+                                };
+                                let sync_clicked = ui
+                                    .add_enabled_ui(!running, |ui| {
+                                        Self::action_btn(ui, &p, sync_label, true, false)
+                                    })
+                                    .inner
+                                    .clicked();
+                                if sync_clicked {
                                     if rem && !pp_val.is_empty() {
                                         let _ = self.engine.ms_save_config(None, Some(&pp_val));
                                     }
                                     self.busy = true;
+                                    // 点下去立刻进「同步中」：不等后台第一个回调，
+                                    // 否则网络那几百毫秒里界面还是死的。
+                                    self.sync_phase = Some(ms_sync::SyncPhase::Fetching);
+                                    self.sync_started = Some(Instant::now());
+                                    self.sync_outcome = None;
+                                    self.sync_hosts_before = self.hosts.len();
                                     let engine = Arc::clone(&self.engine);
                                     let tx = self.tx.clone();
+                                    let phase_tx = tx.clone();
                                     self.rt.spawn(async move {
-                                        match engine.ms_sync(&pp_val, &[], false).await {
+                                        match engine
+                                            .ms_sync_with(&pp_val, &[], false, move |ph| {
+                                                let _ = phase_tx.send(BgEvent::SyncProgress(ph));
+                                            })
+                                            .await
+                                        {
                                             Ok(rep) => {
                                                 let st = engine.ms_status();
                                                 let _ = tx.send(BgEvent::SyncDone {
@@ -7305,7 +8034,9 @@ impl KwDesktopApp {
                                                 });
                                             }
                                             Err(e) => {
-                                                let _ = tx.send(BgEvent::Log(e, LogKind::Err));
+                                                // 失败也要让抽屉里留张红卡：只写日志
+                                                // 等于没反馈，日志抽屉默认是关的。
+                                                let _ = tx.send(BgEvent::SyncFailed(e));
                                             }
                                         }
                                     });
@@ -7313,6 +8044,8 @@ impl KwDesktopApp {
                                 if Self::action_btn(ui, &p, "退出账号", false, true).clicked() {
                                     let _ = self.engine.ms_logout();
                                     self.ms_status = self.engine.ms_status();
+                                    // 换了/退了账号，上一次的结果卡就不再适用了。
+                                    self.sync_outcome = None;
                                 }
                             }
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -7584,6 +8317,84 @@ impl KwDesktopApp {
 
                 if !close_drawer {
                     self.drawer = current;
+                }
+            });
+    }
+
+    /// 同步进行中的进度条：当前阶段高亮，后面的阶段淡着。
+    fn draw_sync_progress(
+        ui: &mut egui::Ui,
+        p: &Palette,
+        phase: ms_sync::SyncPhase,
+        elapsed: Duration,
+    ) {
+        let steps = [
+            (ms_sync::SyncPhase::Fetching, "读取云端"),
+            (ms_sync::SyncPhase::Merging, "解密合并"),
+            (ms_sync::SyncPhase::Uploading, "上传"),
+        ];
+        let idx = steps.iter().position(|(s, _)| *s == phase).unwrap_or(0);
+
+        Frame::NONE
+            .fill(p.surface2)
+            .stroke(Stroke::new(1.0_f32, p.border))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(
+                        RichText::new(format!("正在同步… {:.1}s", elapsed.as_secs_f32()))
+                            .size(12.5)
+                            .strong()
+                            .color(p.text),
+                    );
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    for (i, (_, name)) in steps.iter().enumerate() {
+                        let reached = i <= idx;
+                        Frame::NONE
+                            .fill(if reached { p.accent_soft } else { p.surface3 })
+                            .corner_radius(CornerRadius::same(10))
+                            .inner_margin(Margin::symmetric(9, 3))
+                            .show(ui, |ui| {
+                                ui.label(RichText::new(*name).size(11.5).color(if reached {
+                                    p.accent
+                                } else {
+                                    p.faint
+                                }));
+                            });
+                        if i + 1 < steps.len() {
+                            ui.label(RichText::new("›").size(11.0).color(p.faint));
+                        }
+                    }
+                });
+            });
+    }
+
+    /// 同步结束后的结果卡：成功留绿卡，失败 / 冲突留红卡。
+    fn draw_sync_outcome(ui: &mut egui::Ui, p: &Palette, out: &SyncOutcome) {
+        let (fg, fill, edge) = if out.ok {
+            (p.ok, p.ok_soft, p.ok.gamma_multiply(0.45))
+        } else {
+            (p.danger, p.danger_soft, p.danger.gamma_multiply(0.45))
+        };
+        Frame::NONE
+            .fill(fill)
+            .stroke(Stroke::new(1.0_f32, edge))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(Margin::symmetric(12, 10))
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new(out.title.as_str())
+                        .size(12.5)
+                        .strong()
+                        .color(fg),
+                );
+                ui.add_space(4.0);
+                for line in &out.lines {
+                    ui.label(RichText::new(line.as_str()).size(11.5).color(p.dim));
                 }
             });
     }
@@ -8125,9 +8936,14 @@ fn mon_net_col(
     );
 }
 
-fn mon_procs_card(ui: &mut egui::Ui, p: &Palette, width: f32, s: &MonitorSnapshot) {
+fn mon_procs_card(ui: &mut egui::Ui, p: &Palette, width: f32, s: &MonitorSnapshot, sort_by_mem: &mut bool) {
     mon_card(ui, p, width, |ui| {
-        mon_cardhead(ui, p, "高占用进程", "按 CPU 排序 · top 6");
+        let sort_label = if *sort_by_mem {
+            "按 内存 排序 · top 6"
+        } else {
+            "按 CPU 排序 · top 6"
+        };
+        mon_cardhead(ui, p, "高占用进程", sort_label);
         if s.processes.is_empty() {
             ui.label(
                 RichText::new("没有可展示的进程数据")
@@ -8149,6 +8965,14 @@ fn mon_procs_card(ui: &mut egui::Ui, p: &Palette, width: f32, s: &MonitorSnapsho
             .map(|x| x.mem_bytes)
             .fold(0.0f64, f64::max)
             .max(1.0);
+
+        let mut procs = s.processes.clone();
+        if *sort_by_mem {
+            procs.sort_by(|a, b| b.mem_bytes.total_cmp(&a.mem_bytes));
+        } else {
+            procs.sort_by(|a, b| b.cpu.total_cmp(&a.cpu));
+        }
+
         egui::Grid::new("kw_monitor_procs")
             .num_columns(4)
             .spacing([gap, 7.0])
@@ -8171,29 +8995,54 @@ fn mon_procs_card(ui: &mut egui::Ui, p: &Palette, width: f32, s: &MonitorSnapsho
                     Vec2::new(cpu_w, 14.0),
                     Layout::right_to_left(Align::Center),
                     |ui| {
-                        ui.label(RichText::new("CPU").size(10.0).color(p.faint));
+                        let text = if !*sort_by_mem { "CPU ▼" } else { "CPU" };
+                        let col = if !*sort_by_mem { p.accent } else { p.faint };
+                        if ui
+                            .add(egui::Label::new(RichText::new(text).size(10.0).strong().color(col)).sense(Sense::click()))
+                            .on_hover_text("点击按 CPU 占用排序")
+                            .clicked()
+                        {
+                            *sort_by_mem = false;
+                        }
                     },
                 );
                 ui.allocate_ui_with_layout(
                     Vec2::new(mem_w, 14.0),
                     Layout::left_to_right(Align::Center),
                     |ui| {
-                        ui.label(RichText::new("内存").size(10.0).color(p.faint));
+                        let text = if *sort_by_mem { "内存 ▼" } else { "内存" };
+                        let col = if *sort_by_mem { p.accent } else { p.faint };
+                        if ui
+                            .add(egui::Label::new(RichText::new(text).size(10.0).strong().color(col)).sense(Sense::click()))
+                            .on_hover_text("点击按内存占用排序")
+                            .clicked()
+                        {
+                            *sort_by_mem = true;
+                        }
                     },
                 );
                 ui.end_row();
 
-                for pr in s.processes.iter().take(6) {
+                for pr in procs.iter().take(6) {
                     ui.allocate_ui_with_layout(
                         Vec2::new(pid_w, 16.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            ui.label(
-                                RichText::new(pr.pid.to_string())
-                                    .size(10.5)
-                                    .monospace()
-                                    .color(p.dim),
+                            let resp = ui.add(
+                                egui::Label::new(
+                                    RichText::new(pr.pid.to_string())
+                                        .size(10.5)
+                                        .monospace()
+                                        .color(p.dim),
+                                )
+                                .sense(Sense::click()),
                             );
+                            resp.context_menu(|ui| {
+                                if ui.button(format!("📋 复制 PID ({})", pr.pid)).clicked() {
+                                    ui.ctx().copy_text(pr.pid.to_string());
+                                    ui.close_menu();
+                                }
+                            });
                         },
                     );
                     ui.allocate_ui_with_layout(
@@ -8212,11 +9061,12 @@ fn mon_procs_card(ui: &mut egui::Ui, p: &Palette, width: f32, s: &MonitorSnapsho
                         Vec2::new(cpu_w, 16.0),
                         Layout::right_to_left(Align::Center),
                         |ui| {
+                            let col = if pr.cpu > 50.0 { p.warn } else { p.dim };
                             ui.label(
                                 RichText::new(format!("{:.1}%", pr.cpu))
                                     .size(10.5)
                                     .monospace()
-                                    .color(p.dim),
+                                    .color(col),
                             );
                         },
                     );
@@ -8544,7 +9394,10 @@ mod login_pw_tests {
         assert_eq!(read_login_pw(p, "host-1"), None);
         write_login_pw(p, "host-1", Some("s3cret"));
         assert_eq!(read_login_pw(p, "host-1").as_deref(), Some("s3cret"));
-        assert!(!p.join("config.json").exists(), "密码绝不能写进 config.json");
+        assert!(
+            !p.join("config.json").exists(),
+            "密码绝不能写进 config.json"
+        );
         assert!(login_pw_file(p).exists());
         write_login_pw(p, "host-1", None);
         assert_eq!(read_login_pw(p, "host-1"), None);
@@ -8601,5 +9454,89 @@ mod auth_method_tests {
         assert!(!private_key_needs_passphrase(p1.to_str().unwrap()));
         assert!(private_key_needs_passphrase(p2.to_str().unwrap()));
         assert!(!private_key_needs_passphrase("Z:/definitely-missing.pem"));
+    }
+}
+
+/// 云同步结果卡的「说清楚」测试。
+///
+/// 这几条是反证：只要后端把 `knownHostConflicts` 或 `addedHosts` 的
+/// camelCase 字段改掉、或者把冲突挪到外层，卡片就会退化成一句「同步完成」，
+/// 用户又回到「点了没反应」的状态 —— 所以字段路径必须被钉住。
+#[cfg(test)]
+mod sync_outcome_tests {
+    use super::*;
+
+    fn sample(
+        pulled: bool,
+        pushed: bool,
+        counts: (u64, u64, u64, u64, u64),
+        conflicts: Vec<Value>,
+    ) -> Value {
+        json!({
+            "pulled": pulled,
+            "pushed": pushed,
+            "lastSyncAt": 1_700_000_000_000u64,
+            "report": {
+                "addedHosts": counts.0,
+                "updatedHosts": counts.1,
+                "deletedHosts": counts.2,
+                "syncedNotes": counts.3,
+                "importedKeys": counts.4,
+                "knownHostConflicts": conflicts,
+            }
+        })
+    }
+
+    fn body(out: &SyncOutcome) -> String {
+        out.lines.join(" | ")
+    }
+
+    #[test]
+    fn merged_result_reports_real_numbers() {
+        let r = sample(true, true, (2, 1, 0, 3, 1), vec![]);
+        let out = KwDesktopApp::build_sync_outcome(&r, 7, 8, Duration::from_millis(2400));
+        assert!(out.ok);
+        assert!(out.title.contains("2.4s"), "{}", out.title);
+        let text = body(&out);
+        assert!(text.contains("7 台 → 8 台"), "{text}");
+        assert!(
+            text.contains("新增 2 · 更新 1 · 删除 0 · 备注 3 · 私钥 1"),
+            "{text}"
+        );
+        assert!(text.contains("上次同步"), "{text}");
+    }
+
+    #[test]
+    fn untouched_library_says_so_instead_of_showing_zeros() {
+        let r = sample(true, true, (0, 0, 0, 0, 0), vec![]);
+        let out = KwDesktopApp::build_sync_outcome(&r, 5, 5, Duration::from_millis(900));
+        let text = body(&out);
+        assert!(text.contains("两边本来就一致"), "{text}");
+        assert!(!text.contains("新增 0"), "不该把一排 0 摊给用户：{text}");
+    }
+
+    #[test]
+    fn conflicts_block_upload_and_name_the_host() {
+        let r = sample(
+            true,
+            false,
+            (0, 0, 0, 0, 0),
+            vec![json!({"host": "10.0.0.9", "port": 2222})],
+        );
+        let out = KwDesktopApp::build_sync_outcome(&r, 3, 3, Duration::from_secs(1));
+        assert!(!out.ok);
+        assert!(out.title.contains("1 项"), "{}", out.title);
+        let text = body(&out);
+        assert!(text.contains("10.0.0.9:2222"), "{text}");
+        assert!(text.contains("未上传"), "{text}");
+    }
+
+    #[test]
+    fn first_upload_is_labelled_as_such() {
+        let r = sample(false, true, (9, 0, 0, 0, 4), vec![]);
+        let out = KwDesktopApp::build_sync_outcome(&r, 0, 9, Duration::from_millis(1500));
+        let text = body(&out);
+        assert!(text.contains("首次上传"), "{text}");
+        assert!(text.contains("0 台 → 9 台"), "{text}");
     }
 }
