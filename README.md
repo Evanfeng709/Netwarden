@@ -12,7 +12,8 @@ HTTP 服务，进程内直接调用 `kw-ffi::MobileEngine`，Working Set 从 120
 SSH 层是 russh 0.65 + `ring`。`assets/public` 仍是独立浏览器模式的调试前端，桌面窗口不加载它。
 
 > 当前版本：桌面 **v2026.11.15.1** / 手机 **v2026.11.16.1**；
-> 工作区目录仍叫 `ssh-keywarden-rs`，crate 名仍是 `kw-*`，旧版 Electron 在 `../ssh-keywarden`。
+> GitHub 仓库：[Evanfeng709/Netwarden](https://github.com/Evanfeng709/Netwarden)。
+> crate 名仍是 `kw-*`，旧版 Electron 在 `../ssh-keywarden`。
 > 改代码前先确认动的是哪一版。
 
 ## 功能一览
@@ -58,7 +59,7 @@ SSH 层是 russh 0.65 + `ring`。`assets/public` 仍是独立浏览器模式的�
 ### 桌面端
 
 ```bash
-cd D:/my-own-program/ssh-keywarden-rs
+cd D:/my-own-program/Netwarden
 
 # 开发态：debug 构建保留控制台，方便看日志
 cargo run -p kw-desktop
@@ -102,7 +103,7 @@ armeabi-v7a + x86_64）。
 ## 架构
 
 ```
-ssh-keywarden-rs/
+Netwarden/
 ├── crates/
 │   ├── kw-core/       Secret：敏感串封装（zeroize，不实现 Serialize，Debug 只出 ***）
 │   ├── kw-keys/       纯文本规则层：authorized_keys 解析/渲染、keygen、本地扫描、
